@@ -16,6 +16,7 @@ import mesosphere.marathon.core.task.update.TaskStatusUpdateConfig
 import mesosphere.marathon.state.ResourceRole
 import mesosphere.marathon.storage.StorageConf
 import mesosphere.mesos.MatcherConf
+import mesosphere.mesos.client.MesosConf
 import org.rogach.scallop.{ ScallopConf, ScallopOption }
 
 import scala.sys.SystemProperties
@@ -36,7 +37,7 @@ trait MarathonConf
     with LeaderProxyConf with MarathonSchedulerServiceConfig with OfferMatcherManagerConfig with OfferProcessorConfig
     with PluginManagerConfiguration with ReviveOffersConfig with StorageConf with KillConfig
     with TaskJobsConfig with TaskStatusUpdateConfig with InstanceTrackerConfig with DeploymentConfig with ZookeeperConf
-    with MatcherConf {
+    with MatcherConf with MesosConf {
 
   lazy val mesosMaster = opt[String](
     "master",

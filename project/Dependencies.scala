@@ -48,6 +48,7 @@ object Dependencies {
     commonsCompress % "compile", // used for tar flow
     commonsIO % "compile",
     akkaSse % "compile",
+    alpakkaCodes % "compile",
 
 
     // test
@@ -117,6 +118,7 @@ object Dependency {
   val excludeMortbayJetty = ExclusionRule(organization = "org.mortbay.jetty")
   val excludeJavaxServlet = ExclusionRule(organization = "javax.servlet")
 
+  val alpakkaCodes = "com.lightbend.akka" %% "akka-stream-alpakka-simple-codecs" % V.Alpakka
   val aws = "com.amazonaws" % "aws-java-sdk-core" % V.Aws
   val alpakkaS3 = "com.lightbend.akka" %% "akka-stream-alpakka-s3" % V.Alpakka
   val akkaActor = "com.typesafe.akka" %% "akka-actor" % V.Akka
