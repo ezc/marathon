@@ -1,12 +1,13 @@
 package mesosphere.mesos.client
 
+import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.headers.Accept
 import akka.stream.ActorMaterializer
 import akka.stream.alpakka.recordio.scaladsl.RecordIOFraming
-import akka.stream.scaladsl.{BroadcastHub, Flow, Keep, Sink, Source}
+import akka.stream.scaladsl._
 import com.typesafe.scalalogging.StrictLogging
 import mesosphere.marathon
 import mesosphere.marathon.{AllConf, MarathonConf}
@@ -30,7 +31,7 @@ class MesosClient(conf: MarathonConf)(
   val Array(host, port) = conf.mesosMaster().split(":")
   logger.info(s"Connecting to mesos master: $host:$port")
 
-  var subscribedConnection: Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] = Http().outgoingConnection(host, port.toInt)
+  val httpConnection: Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] = Http().outgoingConnection(host, port.toInt)
   val recordIoScanner = RecordIOFraming.scanner()
 
   val overflowStrategy = akka.stream.OverflowStrategy.backpressure
@@ -83,7 +84,7 @@ class MesosClient(conf: MarathonConf)(
     * <more events>
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1
     */
-  private def subscribe(): Source[String, _] = {
+  private def subscribe(): Source[String, NotUsed] = {
     val MesosStreamId = "Mesos-Stream-Id"
 
     val body =
@@ -109,22 +110,29 @@ class MesosClient(conf: MarathonConf)(
 
     logger.info(s"Subscribing: $request")
 
-    Source.single(request)
-      .via(subscribedConnection)
-      .map { res =>
-        res.status match {
-          case StatusCodes.OK =>
-            logger.info(s"Connected successfully to ${conf.mesosMaster()}");
-            val mesosStreamId = res.headers
-              .find(_.name() == MesosStreamId)
-              .map(_.value())
-              .getOrElse(throw new IllegalStateException("Subscribe always returns a streamId"))
-            streamIdPromise.success(mesosStreamId)
-            res
-          case StatusCodes.TemporaryRedirect => throw new IllegalArgumentException(s"${conf.mesosMaster} is unavailable") // Handle a redirect to a current leader
-          case _ => throw new IllegalArgumentException(s"Mesos server error: $res")
+    def subscribedHandler(streamId: Promise[String]): Flow[HttpResponse, HttpResponse, NotUsed] = {
+      Flow[HttpResponse]
+        .map { res =>
+          res.status match {
+            case StatusCodes.OK =>
+              logger.info(s"Connected successfully to ${conf.mesosMaster()}");
+              val mesosStreamId = res.headers
+                .find(_.name() == MesosStreamId)
+                .map(_.value())
+                .getOrElse(throw new IllegalStateException("Subscribe always returns a streamId"))
+              streamId.success(mesosStreamId)
+              res
+            case StatusCodes.TemporaryRedirect =>
+              throw new IllegalArgumentException(s"${conf.mesosMaster} is unavailable") // Handle a redirect to a current leader
+            case _ =>
+              throw new IllegalArgumentException(s"Mesos server error: $res")
+          }
         }
-      }
+    }
+
+    Source.single(request)
+      .via(httpConnection)
+      .via(subscribedHandler(streamIdPromise))
       .flatMapConcat(_.entity.dataBytes)
       .map{ e => logger.info(s"HttpEntity $e"); e }
       .via(recordIoScanner)
