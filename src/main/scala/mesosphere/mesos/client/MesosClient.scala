@@ -8,85 +8,54 @@ import akka.http.scaladsl.model.headers.Accept
 import akka.stream.ActorMaterializer
 import akka.stream.alpakka.recordio.scaladsl.RecordIOFraming
 import akka.stream.scaladsl._
+import akka.util.ByteString
 import com.typesafe.scalalogging.StrictLogging
 import mesosphere.marathon
 import mesosphere.marathon.{AllConf, MarathonConf}
+import org.apache.mesos.v1.Protos.FrameworkInfo
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
-class MesosClient(conf: MarathonConf)(
-    implicit val system: ActorSystem,
+class MesosClient(
+  conf: MarathonConf,
+    frameworkInfo: FrameworkInfo)(
+    implicit
+    val system: ActorSystem,
     implicit val materializer: ActorMaterializer,
     implicit val executionContext: ExecutionContext
-) extends StrictLogging {
+) extends MesosApi with StrictLogging {
 
-  /**
-    * Inbound traffic is handled via a persistent connection to the `/api/v1/scheduler` endpoint.
-    * Each message is encoded in RecordIO format, which essentially prepends to a single record
-    * (either JSON or serialized protobuf) its length in bytes: [<length>\n<json string|protobuf bytes>]
-    *
-    * http://mesos.apache.org/documentation/latest/scheduler-http-api/#recordio-response-format-1
-    */
   val Array(host, port) = conf.mesosMaster().split(":")
-  logger.info(s"Connecting to mesos master: $host:$port")
-
-  val httpConnection: Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] = Http().outgoingConnection(host, port.toInt)
-  val recordIoScanner = RecordIOFraming.scanner()
 
   val overflowStrategy = akka.stream.OverflowStrategy.backpressure
 
+  val MesosStreamIdHeader = "Mesos-Stream-Id"
   val streamIdPromise = Promise[String]()
   val mesosStreamId: Future[String] = streamIdPromise.future
-  mesosStreamId.foreach(id => logger.info(s"MesosStreamId: $id"))
-
-  def dispatchRequest(request: HttpRequest): Future[HttpResponse] = ???
 
   /**
-    * Subscribe call should be the first or the client to make:
-    *
-    * SUBSCRIBE Request (JSON):
-    *
-    * POST /api/v1/scheduler  HTTP/1.1
-    *
-    * Host: masterhost:5050
-    * Content-Type: application/json
-    * Accept: application/json
-    * Connection: close
-    *
-    * {
-    *    "type"       : "SUBSCRIBE",
-    *    "subscribe"  : {
-    *       "framework_info"  : {
-    *         "user" :  "foo",
-    *         "name" :  "Example HTTP Framework",
-    *         "roles": ["test"],
-    *         "capabilities" : [{"type": "MULTI_ROLE"}]
-    *       }
-    *   }
+    * Subscribe call should be the first or the client to make. It will initialize the connection to mesos
+    * and return a `Source[String, NotUser]` with mesos events. It is declared lazy to decouple MesosClient
+    * object creation from connection initialization. All subsequent calls will return the previously created
+    * event source.
+    * The connection is initialized with a POST /api/v1/scheduler with the framework info in the body. The request
+    * is answered by a SUBSCRIBED event which contains MesosStreamId header. This is reused by all later calls to
+    * /api/v1/scheduler.
+    * Multiple subscribers can attach to returned `Source[String, NotUsed]` to receive mesos Events. The stream will
+    * be closed either on connection error or connection shutdown e.g.:
+    * ```
+    * client.subscribe.runWith(Sink.ignore).onComplete{
+    *  case Success(res) => logger.info(s"Stream completed: $res")
+    *  case Failure(e) => logger.error(s"Error in stream: $e")
     * }
+    * ```
     *
-    * SUBSCRIBE Response Event (JSON):
-    * HTTP/1.1 200 OK
-    *
-    * Content-Type: application/json
-    * Transfer-Encoding: chunked
-    * Mesos-Stream-Id: 130ae4e3-6b13-4ef4-baa9-9f2e85c3e9af
-    *
-    * <event length>
-    * {
-    *  "type"         : "SUBSCRIBED",
-    *  "subscribed"   : {
-    *      "framework_id"               : {"value":"12220-3440-12532-2345"},
-    *      "heartbeat_interval_seconds" : 15
-    *   }
-    * }
-    * <more events>
+    * Mesos documentation on SUBSCRIBE call:
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1
     */
-  private def subscribe(): Source[String, NotUsed] = {
-    val MesosStreamId = "Mesos-Stream-Id"
-
+  lazy val subscribe: Source[String, NotUsed] = {
+    // TODO: build body from FrameworkInfo
     val body =
       """
         |{
@@ -110,39 +79,56 @@ class MesosClient(conf: MarathonConf)(
 
     logger.info(s"Subscribing: $request")
 
-    def subscribedHandler(streamId: Promise[String]): Flow[HttpResponse, HttpResponse, NotUsed] = {
-      Flow[HttpResponse]
-        .map { res =>
-          res.status match {
-            case StatusCodes.OK =>
-              logger.info(s"Connected successfully to ${conf.mesosMaster()}");
-              val mesosStreamId = res.headers
-                .find(_.name() == MesosStreamId)
-                .map(_.value())
-                .getOrElse(throw new IllegalStateException("Subscribe always returns a streamId"))
-              streamId.success(mesosStreamId)
-              res
-            case StatusCodes.TemporaryRedirect =>
-              throw new IllegalArgumentException(s"${conf.mesosMaster} is unavailable") // Handle a redirect to a current leader
-            case _ =>
-              throw new IllegalArgumentException(s"Mesos server error: $res")
-          }
-        }
+    val httpConnection: Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] = Http().outgoingConnection(host, port.toInt)
+
+    /**
+      * Inbound traffic is handled via a persistent connection to the `/api/v1/scheduler` endpoint.
+      * Each message is encoded in RecordIO format, which essentially prepends to a single record
+      * (either JSON or serialized protobuf) its length in bytes: [<length>\n<json string|protobuf bytes>]
+      *
+      * http://mesos.apache.org/documentation/latest/scheduler-http-api/#recordio-response-format-1
+      */
+    val recordIoScanner: Flow[ByteString, ByteString, NotUsed] = RecordIOFraming.scanner()
+
+    val subscribedEvent: Flow[HttpResponse, HttpResponse, NotUsed] = Flow[HttpResponse].map { res =>
+      res.status match {
+        case StatusCodes.OK =>
+          logger.info(s"Connected successfully to ${conf.mesosMaster()}");
+          val mesosStreamId = res.headers
+            .find(_.name() == MesosStreamIdHeader)
+            .map(_.value())
+            .getOrElse(throw new IllegalStateException(s"Missing MesosStreamId header in ${res.headers}"))
+          streamIdPromise.success(mesosStreamId)
+          res
+        case StatusCodes.TemporaryRedirect =>
+          throw new IllegalArgumentException(s"${conf.mesosMaster} is unavailable") // Handle a redirect to a current leader
+        case _ =>
+          throw new IllegalArgumentException(s"Mesos server error: $res")
+      }
     }
 
-    Source.single(request)
+    val entityBytes: Flow[HttpResponse, ByteString, NotUsed] = Flow[HttpResponse].flatMapConcat(_.entity.dataBytes)
+
+    val eventSerializer: Flow[ByteString, String, NotUsed] = Flow[ByteString].map(_.utf8String)
+
+    val messageFlow = Flow[HttpRequest]
+      .map{e => logger.info(s"Connecting to mesos master: $host:$port"); e}
       .via(httpConnection)
-      .via(subscribedHandler(streamIdPromise))
-      .flatMapConcat(_.entity.dataBytes)
-      .map{ e => logger.info(s"HttpEntity $e"); e }
+      .map{ e => logger.info(s"HttpResponse $e"); e }
+      .via(subscribedEvent)
+      .via(entityBytes)
       .via(recordIoScanner)
-      .map(_.utf8String)
+      .via(eventSerializer)
       .map{ e => logger.info(s"Mesos Event: $e"); e }
+
+    Source.single(request)
+      .via(messageFlow)
       .toMat(BroadcastHub.sink)(Keep.right).run()
   }
 }
 
 trait MesosApi { this: MesosClient =>
+  ???
 }
 
 object MesosClient extends StrictLogging {
@@ -153,14 +139,11 @@ object MesosClient extends StrictLogging {
     implicit val executionContext = system.dispatcher
 
     val conf: MarathonConf = new AllConf(args.to[marathon.Seq])
-    val client = new MesosClient(conf)
+    val client = new MesosClient(conf, null)
 
-    client.subscribe().runWith(Sink.head).onComplete{
-      case Success(res) => logger.info(s"res")
-      case Failure(e) => logger.error(s"$e")
+    client.subscribe.runWith(Sink.ignore).onComplete{
+      case Success(res) => logger.info(s"Stream completed: $res")
+      case Failure(e) => logger.error(s"Error in stream: $e")
     }
-
-    // Let's wait
-    scala.io.StdIn.readLine()
   }
 }
