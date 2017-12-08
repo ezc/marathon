@@ -30,14 +30,14 @@ class MesosClient(
 
   val overflowStrategy = akka.stream.OverflowStrategy.backpressure
 
-  val MesosStreamIdHeader = "Mesos-Stream-Id"
-  val streamIdPromise = Promise[String]()
-  val mesosStreamId: Future[String] = streamIdPromise.future
+  val mesosStreamIdHeader = "Mesos-Stream-Id"
+  val mesosStreamIdPromise = Promise[String]()
+  val mesosStreamId: Future[String] = mesosStreamIdPromise.future
 
   /**
     * Subscribe call should be the first or the client to make. It will initialize the connection to mesos
-    * and return a `Source[String, NotUser]` with mesos events. It is declared lazy to decouple MesosClient
-    * object creation from connection initialization. All subsequent calls will return the previously created
+    * and return a `Source[String, NotUser]` with mesos events. It is declared lazy to decouple instantiation of the
+    * MesosClient instance from connection initialization. All subsequent calls will return the previously created
     * event source.
     * The connection is initialized with a POST /api/v1/scheduler with the framework info in the body. The request
     * is answered by a SUBSCRIBED event which contains MesosStreamId header. This is reused by all later calls to
@@ -77,8 +77,6 @@ class MesosClient(
       entity = HttpEntity(MediaTypes.`application/json`, body),
       headers = List(Accept(MediaTypes.`application/json`)))
 
-    logger.info(s"Subscribing: $request")
-
     val httpConnection: Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] = Http().outgoingConnection(host, port.toInt)
 
     /**
@@ -90,15 +88,15 @@ class MesosClient(
       */
     val recordIoScanner: Flow[ByteString, ByteString, NotUsed] = RecordIOFraming.scanner()
 
-    val subscribedEvent: Flow[HttpResponse, HttpResponse, NotUsed] = Flow[HttpResponse].map { res =>
+    val subscribedHandler: Flow[HttpResponse, HttpResponse, NotUsed] = Flow[HttpResponse].map { res =>
       res.status match {
         case StatusCodes.OK =>
           logger.info(s"Connected successfully to ${conf.mesosMaster()}");
           val mesosStreamId = res.headers
-            .find(_.name() == MesosStreamIdHeader)
+            .find(_.name() == mesosStreamIdHeader)
             .map(_.value())
             .getOrElse(throw new IllegalStateException(s"Missing MesosStreamId header in ${res.headers}"))
-          streamIdPromise.success(mesosStreamId)
+          mesosStreamIdPromise.success(mesosStreamId)
           res
         case StatusCodes.TemporaryRedirect =>
           throw new IllegalArgumentException(s"${conf.mesosMaster} is unavailable") // Handle a redirect to a current leader
@@ -107,19 +105,21 @@ class MesosClient(
       }
     }
 
-    val entityBytes: Flow[HttpResponse, ByteString, NotUsed] = Flow[HttpResponse].flatMapConcat(_.entity.dataBytes)
+    val entityBytesExtractor: Flow[HttpResponse, ByteString, NotUsed] = Flow[HttpResponse].flatMapConcat(_.entity.dataBytes)
 
-    val eventSerializer: Flow[ByteString, String, NotUsed] = Flow[ByteString].map(_.utf8String)
+    val eventDeserializer: Flow[ByteString, String, NotUsed] = Flow[ByteString].map(_.utf8String)
+
+    def log[T](prefix: String): Flow[T, T, NotUsed] = Flow[T].map{e => logger.info(s"$prefix$e"); e}
 
     val messageFlow = Flow[HttpRequest]
-      .map{e => logger.info(s"Connecting to mesos master: $host:$port"); e}
+      .via(log(s"Connecting to mesos master: $host:$port"))
       .via(httpConnection)
-      .map{ e => logger.info(s"HttpResponse $e"); e }
-      .via(subscribedEvent)
-      .via(entityBytes)
+      .via(log("HttpResponse: "))
+      .via(subscribedHandler)
+      .via(entityBytesExtractor)
       .via(recordIoScanner)
-      .via(eventSerializer)
-      .map{ e => logger.info(s"Mesos Event: $e"); e }
+      .via(eventDeserializer)
+      .via(log("Mesos Event: "))
 
     Source.single(request)
       .via(messageFlow)
@@ -128,8 +128,16 @@ class MesosClient(
 }
 
 trait MesosApi { this: MesosClient =>
-  ???
+
 }
+
+// TODO: PLAN
+// TODO: Extract into a marathon sub-project
+// TODO: Add v1 protobuf files and use scalapb (https://scalapb.github.io/) to create scala case classes
+// TODO: Set FrameworkInfo on SUBSCRIBE request
+// TODO: Switch from `application/json` to `application/x-protobuf`
+// TODO: Provide a Sink[Call, NotUsed] to make calls to mesos `api/v1/scheduler`
+// TODO: Extract API trait
 
 object MesosClient extends StrictLogging {
 
@@ -142,8 +150,8 @@ object MesosClient extends StrictLogging {
     val client = new MesosClient(conf, null)
 
     client.subscribe.runWith(Sink.ignore).onComplete{
-      case Success(res) => logger.info(s"Stream completed: $res")
-      case Failure(e) => logger.error(s"Error in stream: $e")
+      case Success(res) => logger.info(s"Stream completed: $res"); system.terminate()
+      case Failure(e) => logger.error(s"Error in stream: $e"); system.terminate()
     }
   }
 }
