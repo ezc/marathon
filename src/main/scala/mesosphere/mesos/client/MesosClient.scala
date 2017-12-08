@@ -1,18 +1,19 @@
 package mesosphere.mesos.client
 
-import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
-import akka.http.scaladsl.model.headers.Accept
+import akka.http.scaladsl.model.headers.{Accept, RawHeader}
 import akka.stream.ActorMaterializer
 import akka.stream.alpakka.recordio.scaladsl.RecordIOFraming
 import akka.stream.scaladsl._
 import akka.util.ByteString
+import akka.{Done, NotUsed}
 import com.typesafe.scalalogging.StrictLogging
 import mesosphere.marathon
 import mesosphere.marathon.{AllConf, MarathonConf}
 import org.apache.mesos.v1.Protos.FrameworkInfo
+import play.api.libs.json.{JsObject, JsValue, Json}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
@@ -34,36 +35,19 @@ class MesosClient(
   val mesosStreamIdPromise = Promise[String]()
   val mesosStreamId: Future[String] = mesosStreamIdPromise.future
 
-  /**
-    * Subscribe call should be the first or the client to make. It will initialize the connection to mesos
-    * and return a `Source[String, NotUser]` with mesos events. It is declared lazy to decouple instantiation of the
-    * MesosClient instance from connection initialization. All subsequent calls will return the previously created
-    * event source.
-    * The connection is initialized with a POST /api/v1/scheduler with the framework info in the body. The request
-    * is answered by a SUBSCRIBED event which contains MesosStreamId header. This is reused by all later calls to
-    * /api/v1/scheduler.
-    * Multiple subscribers can attach to returned `Source[String, NotUsed]` to receive mesos Events. The stream will
-    * be closed either on connection error or connection shutdown e.g.:
-    * ```
-    * client.subscribe.runWith(Sink.ignore).onComplete{
-    *  case Success(res) => logger.info(s"Stream completed: $res")
-    *  case Failure(e) => logger.error(s"Error in stream: $e")
-    * }
-    * ```
-    *
-    * Mesos documentation on SUBSCRIBE call:
-    * http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1
-    */
-  lazy val subscribe: Source[String, NotUsed] = {
+  /** It is declared lazy to decouple instantiation of the MesosClient instance from connection initialization. */
+  override lazy val source: Source[String, NotUsed] = {
     // TODO: build body from FrameworkInfo
     val body =
       """
         |{
         |  "type"       : "SUBSCRIBE",
+        |  "framework_id"   : {"value" : "84b4efc0-545c-485c-a044-7c8e52b67379-1111"},
         |  "subscribe"  : {
         |    "framework_info"  : {
         |      "user" :  "foo",
         |      "name" :  "Example HTTP Framework",
+        |      "id"   : {"value" : "84b4efc0-545c-485c-a044-7c8e52b67379-1111"},
         |      "roles": ["test"],
         |      "capabilities" : [{"type": "MULTI_ROLE"}]
         |    }
@@ -111,7 +95,7 @@ class MesosClient(
 
     def log[T](prefix: String): Flow[T, T, NotUsed] = Flow[T].map{e => logger.info(s"$prefix$e"); e}
 
-    val messageFlow = Flow[HttpRequest]
+    val flow = Flow[HttpRequest]
       .via(log(s"Connecting to mesos master: $host:$port"))
       .via(httpConnection)
       .via(log("HttpResponse: "))
@@ -122,13 +106,71 @@ class MesosClient(
       .via(log("Mesos Event: "))
 
     Source.single(request)
-      .via(messageFlow)
+      .via(flow)
       .toMat(BroadcastHub.sink)(Keep.right).run()
   }
+
+  // ***************** Outbound mesos connections ******************
+  // A sink for mesos events. We use `Http().singleRequest()` method thus creating a new HTTP request every time.
+  private val mesosSink: Sink[(String, String), Future[Done]] = Sink.foreach[(String, String)]{case (mesosStreamId, call) =>
+
+    logger.info(s"Sending: $call")
+
+    val request = HttpRequest(
+      HttpMethods.POST,
+      uri = Uri(s"http://$host:$port/api/v1/scheduler"),
+      entity = HttpEntity(MediaTypes.`application/json`, call),
+      headers = List(Accept(MediaTypes.`application/json`), RawHeader("Mesos-Stream-Id", mesosStreamId)))
+
+    Http().singleRequest(request).map{response =>
+      logger.info(s"Response: $response")
+      response.discardEntityBytes()}
+  }
+
+  // Attach a MergeHub Source to mesos sink. This will materialize to a corresponding Sink.
+  private val sinkHub: RunnableGraph[Sink[String, NotUsed]] =
+    MergeHub.source[String](perProducerBufferSize = 16)
+      .mapAsync(1)(e => mesosStreamId.map(id => (id, e)))
+      .to(mesosSink)
+
+  // By running/materializing the consumer we get back a Sink, and hence now have access to feed elements into it.
+  // This Sink can be materialized any number of times, and every element that enters the Sink will be consumed by
+  // our consumer.
+  override val sink: Sink[String, NotUsed] = sinkHub.run()
 }
 
-trait MesosApi { this: MesosClient =>
+trait MesosApi {
 
+  /**
+    * First call to this method will initialize the connection to mesos and return a `Source[String, NotUser]` with
+    * mesos `Event`s. All subsequent calls will return the previously created event source.
+    * The connection is initialized with a `POST /api/v1/scheduler` with the framework info in the body. The request
+    * is answered by a `SUBSCRIBED` event which contains `MesosStreamId` header. This is reused by all later calls to
+    * `/api/v1/scheduler`.
+    * Multiple subscribers can attach to returned `Source[String, NotUsed]` to receive mesos events. The stream will
+    * be closed either on connection error or connection shutdown e.g.:
+    * ```
+    * client.source.runWith(Sink.ignore).onComplete{
+    *  case Success(res) => logger.info(s"Stream completed: $res")
+    *  case Failure(e) => logger.error(s"Error in stream: $e")
+    * }
+    * ```
+    *
+    * Mesos documentation on SUBSCRIBE call:
+    * http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1
+    */
+  def source: Source[String, NotUsed]
+
+  /** Sink for mesos calls. Multiple publishers can materialize this sink to send mesos `Call`s. Every `Call` is sent
+    * using a new HTTP connection.
+    * Note: a scheduler can't send calls to mesos without subscribing first (see [MesosClient.source] method). Calls
+    * published to sink without a successful subscription will be buffered and will have to wait for subscription
+    * connection. Always call `source()` first.
+    *
+    * More on mesos `Call`s:
+    * http://mesos.apache.org/documentation/latest/scheduler-http-api/#calls
+    */
+  def sink: Sink[String, NotUsed]
 }
 
 // TODO: PLAN
@@ -136,7 +178,6 @@ trait MesosApi { this: MesosClient =>
 // TODO: Add v1 protobuf files and use scalapb (https://scalapb.github.io/) to create scala case classes
 // TODO: Set FrameworkInfo on SUBSCRIBE request
 // TODO: Switch from `application/json` to `application/x-protobuf`
-// TODO: Provide a Sink[Call, NotUsed] to make calls to mesos `api/v1/scheduler`
 // TODO: Extract API trait
 
 object MesosClient extends StrictLogging {
@@ -149,7 +190,30 @@ object MesosClient extends StrictLogging {
     val conf: MarathonConf = new AllConf(args.to[marathon.Seq])
     val client = new MesosClient(conf, null)
 
-    client.subscribe.runWith(Sink.ignore).onComplete{
+    client.source.runWith(Sink.foreach { event =>
+
+      val offerJson: JsValue = Json.parse(event)
+      val eventType = (offerJson \ "type").as[String]
+
+      // Test case: decline first offer received
+      if (eventType == "OFFERS") {
+        val offerId = ((offerJson \ "offers" \ "offers").as[List[JsObject]].head \ "id" \ "value").as[String]
+        logger.info(s"Declining offer with $offerId")
+        val decline = s"""
+                         |{
+                         |  "framework_id"    : {"value" : "84b4efc0-545c-485c-a044-7c8e52b67379-1111"},
+                         |  "type"            : "DECLINE",
+                         |  "decline"         : {
+                         |    "offer_ids" : [
+                         |                   {"value" : "$offerId"}
+                         |                  ],
+                         |    "filters"   : {"refuse_seconds" : 5.0}
+                         |  }
+                         |}""".stripMargin
+        Source.single(decline).runWith(client.sink)
+      }
+
+    }).onComplete{
       case Success(res) => logger.info(s"Stream completed: $res"); system.terminate()
       case Failure(e) => logger.error(s"Error in stream: $e"); system.terminate()
     }
