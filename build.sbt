@@ -324,3 +324,14 @@ lazy val benchmark = (project in file("benchmark"))
     libraryDependencies ++= Dependencies.benchmark,
     generatorType in Jmh := "asm"
   )
+
+lazy val `mesos-client` = (project in file("mesos-client"))
+  .configs(IntegrationTest)
+  .enablePlugins(GitBranchPrompt, CopyPasteDetector, BasicLintingPlugin, TestWithCoveragePlugin)
+  .settings(commonSettings: _*)
+  .settings(formatSettings: _*)
+  .dependsOn(marathon % "compile->compile; test->test")
+  .settings(
+    name := "mesos-client",
+    libraryDependencies ++= Dependencies.mesosClient
+  )

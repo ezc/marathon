@@ -12,6 +12,13 @@ object Dependencies {
     scalaxml % "provided" // for scapegoat
   )
 
+  val mesosClient = Seq(
+    playJson % "compile",
+    scalaLogging % "compile",
+    akkaStream % "compile",
+    akkaHttp % "compile"
+  )
+
   val excludeSlf4jLog4j12 = ExclusionRule(organization = "org.slf4j", name = "slf4j-log4j12")
   val excludeLog4j = ExclusionRule(organization = "log4j", name = "log4j")
   val excludeJCL = ExclusionRule(organization = "commons-logging", name = "commons-logging")
