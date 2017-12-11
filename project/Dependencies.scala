@@ -120,6 +120,7 @@ object Dependency {
     val JUnitBenchmarks = "0.7.2"
     val JMH = "1.19"
     val ScalaCheck = "1.13.5"
+    val ScalaPb = "0.6.6"
   }
 
   val excludeMortbayJetty = ExclusionRule(organization = "org.mortbay.jetty")
@@ -157,6 +158,7 @@ object Dependency {
   val commonsCompress = "org.apache.commons" % "commons-compress" % V.ApacheCommonsCompress
   val commonsIO = "commons-io" % "commons-io" % V.ApacheCommonsIO
   val akkaSse = "de.heikoseeberger" %% "akka-sse" % V.AkkaSSE
+  val scalaPb = "com.trueaccord.scalapb" %% "compilerplugin" % V.ScalaPb
 
   object Curator {
     /**

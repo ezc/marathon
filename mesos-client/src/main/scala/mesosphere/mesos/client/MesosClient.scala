@@ -3,23 +3,22 @@ package mesosphere.mesos.client
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
-import akka.http.scaladsl.model.headers.{Accept, RawHeader}
+import akka.http.scaladsl.model.headers.{ Accept, RawHeader }
 import akka.stream.ActorMaterializer
 import akka.stream.alpakka.recordio.scaladsl.RecordIOFraming
 import akka.stream.scaladsl._
 import akka.util.ByteString
-import akka.{Done, NotUsed}
+import akka.{ Done, NotUsed }
 import com.typesafe.scalalogging.StrictLogging
-import mesosphere.marathon
-import mesosphere.marathon.{AllConf, MarathonConf}
+import mesosphere.mesos.conf.MesosConf
 import org.apache.mesos.v1.Protos.FrameworkInfo
-import play.api.libs.json.{JsObject, JsValue, Json}
+import play.api.libs.json.{ JsObject, JsValue, Json }
 
-import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.{Failure, Success}
+import scala.concurrent.{ ExecutionContext, Future, Promise }
+import scala.util.{ Failure, Success }
 
 class MesosClient(
-  conf: MarathonConf,
+    conf: MesosConf,
     frameworkInfo: FrameworkInfo)(
     implicit
     val system: ActorSystem,
@@ -36,7 +35,7 @@ class MesosClient(
   val mesosStreamId: Future[String] = mesosStreamIdPromise.future
 
   /** It is declared lazy to decouple instantiation of the MesosClient instance from connection initialization. */
-  override lazy val source: Source[String, NotUsed] = {
+  override lazy val mesosSource: Source[String, NotUsed] = {
     // TODO: build body from FrameworkInfo
     val body =
       """
@@ -72,7 +71,7 @@ class MesosClient(
       */
     val recordIoScanner: Flow[ByteString, ByteString, NotUsed] = RecordIOFraming.scanner()
 
-    val subscribedHandler: Flow[HttpResponse, HttpResponse, NotUsed] = Flow[HttpResponse].map { res =>
+    val connectionHandler: Flow[HttpResponse, HttpResponse, NotUsed] = Flow[HttpResponse].map { res =>
       res.status match {
         case StatusCodes.OK =>
           logger.info(s"Connected successfully to ${conf.mesosMaster()}");
@@ -89,18 +88,18 @@ class MesosClient(
       }
     }
 
-    val entityBytesExtractor: Flow[HttpResponse, ByteString, NotUsed] = Flow[HttpResponse].flatMapConcat(_.entity.dataBytes)
+    val dataBytesExtractor: Flow[HttpResponse, ByteString, NotUsed] = Flow[HttpResponse].flatMapConcat(_.entity.dataBytes)
 
     val eventDeserializer: Flow[ByteString, String, NotUsed] = Flow[ByteString].map(_.utf8String)
 
-    def log[T](prefix: String): Flow[T, T, NotUsed] = Flow[T].map{e => logger.info(s"$prefix$e"); e}
+    def log[T](prefix: String): Flow[T, T, NotUsed] = Flow[T].map{ e => logger.info(s"$prefix$e"); e }
 
     val flow = Flow[HttpRequest]
       .via(log(s"Connecting to mesos master: $host:$port"))
       .via(httpConnection)
       .via(log("HttpResponse: "))
-      .via(subscribedHandler)
-      .via(entityBytesExtractor)
+      .via(connectionHandler)
+      .via(dataBytesExtractor)
       .via(recordIoScanner)
       .via(eventDeserializer)
       .via(log("Mesos Event: "))
@@ -112,31 +111,33 @@ class MesosClient(
 
   // ***************** Outbound mesos connections ******************
   // A sink for mesos events. We use `Http().singleRequest()` method thus creating a new HTTP request every time.
-  private val mesosSink: Sink[(String, String), Future[Done]] = Sink.foreach[(String, String)]{case (mesosStreamId, call) =>
+  private val sink: Sink[(String, String), Future[Done]] = Sink.foreach[(String, String)]{
+    case (mesosStreamId, call) =>
 
-    logger.info(s"Sending: $call")
+      logger.info(s"Sending: $call")
 
-    val request = HttpRequest(
-      HttpMethods.POST,
-      uri = Uri(s"http://$host:$port/api/v1/scheduler"),
-      entity = HttpEntity(MediaTypes.`application/json`, call),
-      headers = List(Accept(MediaTypes.`application/json`), RawHeader("Mesos-Stream-Id", mesosStreamId)))
+      val request = HttpRequest(
+        HttpMethods.POST,
+        uri = Uri(s"http://$host:$port/api/v1/scheduler"),
+        entity = HttpEntity(MediaTypes.`application/json`, call),
+        headers = List(Accept(MediaTypes.`application/json`), RawHeader("Mesos-Stream-Id", mesosStreamId)))
 
-    Http().singleRequest(request).map{response =>
-      logger.info(s"Response: $response")
-      response.discardEntityBytes()}
+      Http().singleRequest(request).map{ response =>
+        logger.info(s"Response: $response")
+        response.discardEntityBytes()
+      }
   }
 
   // Attach a MergeHub Source to mesos sink. This will materialize to a corresponding Sink.
-  private val sinkHub: RunnableGraph[Sink[String, NotUsed]] =
+  private val hub: RunnableGraph[Sink[String, NotUsed]] =
     MergeHub.source[String](perProducerBufferSize = 16)
       .mapAsync(1)(e => mesosStreamId.map(id => (id, e)))
-      .to(mesosSink)
+      .to(sink)
 
   // By running/materializing the consumer we get back a Sink, and hence now have access to feed elements into it.
   // This Sink can be materialized any number of times, and every element that enters the Sink will be consumed by
   // our consumer.
-  override val sink: Sink[String, NotUsed] = sinkHub.run()
+  override val mesosSink: Sink[String, NotUsed] = hub.run()
 }
 
 trait MesosApi {
@@ -159,9 +160,10 @@ trait MesosApi {
     * Mesos documentation on SUBSCRIBE call:
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1
     */
-  def source: Source[String, NotUsed]
+  def mesosSource: Source[String, NotUsed]
 
-  /** Sink for mesos calls. Multiple publishers can materialize this sink to send mesos `Call`s. Every `Call` is sent
+  /**
+    * Sink for mesos calls. Multiple publishers can materialize this sink to send mesos `Call`s. Every `Call` is sent
     * using a new HTTP connection.
     * Note: a scheduler can't send calls to mesos without subscribing first (see [MesosClient.source] method). Calls
     * published to sink without a successful subscription will be buffered and will have to wait for subscription
@@ -170,15 +172,16 @@ trait MesosApi {
     * More on mesos `Call`s:
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#calls
     */
-  def sink: Sink[String, NotUsed]
+  def mesosSink: Sink[String, NotUsed]
 }
 
-// TODO: PLAN
-// TODO: Extract into a marathon sub-project
-// TODO: Add v1 protobuf files and use scalapb (https://scalapb.github.io/) to create scala case classes
+// TODO: PLAN:
+// TODO: ====================================================================================
 // TODO: Set FrameworkInfo on SUBSCRIBE request
 // TODO: Switch from `application/json` to `application/x-protobuf`
-// TODO: Extract API trait
+// TODO: Add helper methods to build mesos `Call`s to the API trait
+// TODO: Add ITs
+// TODO: Add README.md
 
 object MesosClient extends StrictLogging {
 
@@ -187,10 +190,10 @@ object MesosClient extends StrictLogging {
     implicit val materializer = ActorMaterializer()
     implicit val executionContext = system.dispatcher
 
-    val conf: MarathonConf = new AllConf(args.to[marathon.Seq])
+    val conf = new MesosConf(args)
     val client = new MesosClient(conf, null)
 
-    client.source.runWith(Sink.foreach { event =>
+    client.mesosSource.runWith(Sink.foreach { event =>
 
       val offerJson: JsValue = Json.parse(event)
       val eventType = (offerJson \ "type").as[String]
@@ -210,11 +213,12 @@ object MesosClient extends StrictLogging {
                          |    "filters"   : {"refuse_seconds" : 5.0}
                          |  }
                          |}""".stripMargin
-        Source.single(decline).runWith(client.sink)
+        Source.single(decline).runWith(client.mesosSink)
       }
 
     }).onComplete{
-      case Success(res) => logger.info(s"Stream completed: $res"); system.terminate()
+      case Success(res) =>
+        logger.info(s"Stream completed: $res"); system.terminate()
       case Failure(e) => logger.error(s"Error in stream: $e"); system.terminate()
     }
   }

@@ -325,6 +325,7 @@ lazy val benchmark = (project in file("benchmark"))
     generatorType in Jmh := "asm"
   )
 
+// see also mesos-client/README.md
 lazy val `mesos-client` = (project in file("mesos-client"))
   .configs(IntegrationTest)
   .enablePlugins(GitBranchPrompt, CopyPasteDetector, BasicLintingPlugin, TestWithCoveragePlugin)
@@ -333,5 +334,9 @@ lazy val `mesos-client` = (project in file("mesos-client"))
   .dependsOn(marathon % "compile->compile; test->test")
   .settings(
     name := "mesos-client",
-    libraryDependencies ++= Dependencies.mesosClient
+    libraryDependencies ++= Dependencies.mesosClient,
+
+    PB.targets in Compile := Seq(
+      scalapb.gen() -> (sourceManaged in Compile).value
+    )
   )
