@@ -2,6 +2,7 @@ package mesosphere.mesos.client
 
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
+import akka.http.scaladsl.model.MediaType.Compressible
 import akka.http.scaladsl.model._
 import akka.stream.ActorMaterializer
 import akka.stream.alpakka.recordio.scaladsl.RecordIOFraming
@@ -11,9 +12,8 @@ import akka.{Done, NotUsed}
 import com.typesafe.scalalogging.StrictLogging
 import mesosphere.mesos.conf.MesosConf
 import org.apache.mesos.v1.mesos._
-import org.apache.mesos.v1.scheduler.scheduler.Call
+import org.apache.mesos.v1.scheduler.scheduler.{Call, Event}
 import org.apache.mesos.v1.scheduler.scheduler.Call.{Accept, Acknowledge, Decline, Kill, Message, Reconcile, Revive}
-import play.api.libs.json.{JsObject, JsValue, Json}
 import com.google.protobuf
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -37,30 +37,15 @@ class MesosClient(
   val mesosStreamId: Future[String] = mesosStreamIdPromise.future
 
   /** It is declared lazy to decouple instantiation of the MesosClient instance from connection initialization. */
-  override lazy val mesosSource: Source[String, NotUsed] = {
-    // TODO: build body from FrameworkInfo
-    val body =
-      """
-        |{
-        |  "type"       : "SUBSCRIBE",
-        |  "framework_id"   : {"value" : "84b4efc0-545c-485c-a044-7c8e52b67379-1111"},
-        |  "subscribe"  : {
-        |    "framework_info"  : {
-        |      "user" :  "foo",
-        |      "name" :  "Example HTTP Framework",
-        |      "id"   : {"value" : "84b4efc0-545c-485c-a044-7c8e52b67379-1111"},
-        |      "roles": ["test"],
-        |      "capabilities" : [{"type": "MULTI_ROLE"}]
-        |    }
-        |  }
-        |}
-      """.stripMargin
+  override lazy val mesosSource: Source[Event, NotUsed] = {
+
+    val body = subscribe(frameworkInfo).toByteArray
 
     val request = HttpRequest(
       HttpMethods.POST,
       uri = Uri("/api/v1/scheduler"),
-      entity = HttpEntity(MediaTypes.`application/json`, body),
-      headers = List(headers.Accept(MediaTypes.`application/json`)))
+      entity = HttpEntity(ProtobufMediaType, body),
+      headers = List(headers.Accept(ProtobufMediaType)))
 
     val httpConnection: Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] = Http().outgoingConnection(host, port.toInt)
 
@@ -73,26 +58,26 @@ class MesosClient(
       */
     val recordIoScanner: Flow[ByteString, ByteString, NotUsed] = RecordIOFraming.scanner()
 
-    val connectionHandler: Flow[HttpResponse, HttpResponse, NotUsed] = Flow[HttpResponse].map { res =>
-      res.status match {
+    val connectionHandler: Flow[HttpResponse, HttpResponse, NotUsed] = Flow[HttpResponse].map { resp =>
+      resp.status match {
         case StatusCodes.OK =>
           logger.info(s"Connected successfully to ${conf.mesosMaster()}");
-          val mesosStreamId = res.headers
+          val mesosStreamId = resp.headers
             .find(_.name() == mesosStreamIdHeader)
             .map(_.value())
-            .getOrElse(throw new IllegalStateException(s"Missing MesosStreamId header in ${res.headers}"))
+            .getOrElse(throw new IllegalStateException(s"Missing MesosStreamId header in ${resp.headers}"))
           mesosStreamIdPromise.success(mesosStreamId)
-          res
+          resp
         case StatusCodes.TemporaryRedirect =>
           throw new IllegalArgumentException(s"${conf.mesosMaster} is unavailable") // Handle a redirect to a current leader
         case _ =>
-          throw new IllegalArgumentException(s"Mesos server error: $res")
+          throw new IllegalArgumentException(s"Mesos server error: $resp")
       }
     }
 
-    val dataBytesExtractor: Flow[HttpResponse, ByteString, NotUsed] = Flow[HttpResponse].flatMapConcat(_.entity.dataBytes)
+    val dataBytesExtractor: Flow[HttpResponse, ByteString, NotUsed] = Flow[HttpResponse].flatMapConcat(resp => resp.entity.dataBytes)
 
-    val eventDeserializer: Flow[ByteString, String, NotUsed] = Flow[ByteString].map(_.utf8String)
+    val eventDeserializer: Flow[ByteString, Event, NotUsed] = Flow[ByteString].map(bytes => Event.parseFrom(bytes.toArray))
 
     def log[T](prefix: String): Flow[T, T, NotUsed] = Flow[T].map{ e => logger.info(s"$prefix$e"); e }
 
@@ -104,16 +89,19 @@ class MesosClient(
       .via(dataBytesExtractor)
       .via(recordIoScanner)
       .via(eventDeserializer)
-      .via(log("Mesos Event: "))
+      .via(log("Received mesos Event: "))
 
     Source.single(request)
       .via(flow)
       .toMat(BroadcastHub.sink)(Keep.right).run()
   }
 
-  // ***************** Outbound mesos connections ******************
+  val ProtobufMediaType: MediaType.Binary = MediaType.applicationBinary("x-protobuf", Compressible)
+  val ProtobufContentType: ContentType = ContentType.Binary(ProtobufMediaType)
+
+
   // A sink for mesos events. We use `Http().singleRequest()` method thus creating a new HTTP request every time.
-  private val sink: Sink[(String, String), Future[Done]] = Sink.foreach[(String, String)]{
+  private val sink: Sink[(String, Call), Future[Done]] = Sink.foreach[(String, Call)]{
     case (mesosStreamId, call) =>
 
       logger.info(s"Sending: $call")
@@ -121,8 +109,8 @@ class MesosClient(
       val request = HttpRequest(
         HttpMethods.POST,
         uri = Uri(s"http://$host:$port/api/v1/scheduler"),
-        entity = HttpEntity(MediaTypes.`application/json`, call),
-        headers = List(headers.Accept(MediaTypes.`application/json`), headers.RawHeader("Mesos-Stream-Id", mesosStreamId)))
+        entity = HttpEntity(ProtobufMediaType, call.toByteArray),
+        headers = List(headers.RawHeader("Mesos-Stream-Id", mesosStreamId)))
 
       Http().singleRequest(request).map{ response =>
         logger.info(s"Response: $response")
@@ -131,15 +119,15 @@ class MesosClient(
   }
 
   // Attach a MergeHub Source to mesos sink. This will materialize to a corresponding Sink.
-  private val hub: RunnableGraph[Sink[String, NotUsed]] =
-    MergeHub.source[String](perProducerBufferSize = 16)
+  private val hub: RunnableGraph[Sink[Call, NotUsed]] =
+    MergeHub.source[Call](perProducerBufferSize = 16)
       .mapAsync(1)(e => mesosStreamId.map(id => (id, e)))
       .to(sink)
 
   // By running/materializing the consumer we get back a Sink, and hence now have access to feed elements into it.
   // This Sink can be materialized any number of times, and every element that enters the Sink will be consumed by
   // our consumer.
-  override val mesosSink: Sink[String, NotUsed] = hub.run()
+  override val mesosSink: Sink[Call, NotUsed] = hub.run()
 }
 
 trait MesosApi {
@@ -161,7 +149,7 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1
     */
-  def mesosSource: Source[String, NotUsed]
+  def mesosSource: Source[Event, NotUsed]
 
   /**
     * Sink for mesos calls. Multiple publishers can materialize this sink to send mesos `Call`s. Every `Call` is sent
@@ -172,7 +160,7 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#calls
     */
-  def mesosSink: Sink[String, NotUsed]
+  def mesosSink: Sink[Call, NotUsed]
 
   /** ***************************************************************************
     * Helper methods to create mesos `Call`s
@@ -180,6 +168,26 @@ trait MesosApi {
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#calls
     * ***************************************************************************
     */
+
+  /** This is the first step in the communication process between the scheduler and the master. This is also to be
+    * considered as subscription to the “/scheduler” event stream. To subscribe with the master, the scheduler sends
+    * an HTTP POST with a SUBSCRIBE message including the required FrameworkInfo. Note that if
+    * `subscribe.framework_info.id` is not set, master considers the scheduler as a new one and subscribes it by
+    * assigning it a FrameworkID. The HTTP response is a stream in RecordIO format; the event stream begins with a
+    * SUBSCRIBED event.
+    *
+    * Note: this method is used by mesos client to establish connection to mesos master and is not supposed to be called
+    * directly by the framework.
+    *
+    * http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1
+    */
+  protected def subscribe(frameworkInfo: FrameworkInfo): Call = {
+    Call(
+      frameworkId = frameworkInfo.id,
+      subscribe = Some(Call.Subscribe(frameworkInfo)),
+      `type` = Some(Call.Type.SUBSCRIBE)
+    )
+  }
 
   /** Sent by the scheduler when it wants to tear itself down. When Mesos receives this request it will
     * shut down all executors (and consequently kill tasks). It then removes the framework and closes all
@@ -375,29 +383,30 @@ object MesosClient extends StrictLogging {
     implicit val materializer = ActorMaterializer()
     implicit val executionContext = system.dispatcher
 
+    val frameworkID = FrameworkID("84b4efc0-545c-485c-a044-7c8e52b67379-1111")
+    val frameworkInfo = FrameworkInfo(
+      user = "foo",
+      name = "Example FOO Framework",
+      id = Some(frameworkID),
+      roles = Seq("test"),
+      capabilities = Seq(FrameworkInfo.Capability(`type` = Some(FrameworkInfo.Capability.Type.MULTI_ROLE)))
+    )
+
     val conf = new MesosConf(args)
-    val client = new MesosClient(conf, null)
+    val client = new MesosClient(conf, frameworkInfo)
 
     client.mesosSource.runWith(Sink.foreach { event =>
 
-      val offerJson: JsValue = Json.parse(event)
-      val eventType = (offerJson \ "type").as[String]
-
       // Test case: decline first offer received
-      if (eventType == "OFFERS") {
-        val offerId = ((offerJson \ "offers" \ "offers").as[List[JsObject]].head \ "id" \ "value").as[String]
+      if (event.`type`.get == Event.Type.OFFERS) {
+        val offerId = event.offers.get.offers.head.id
         logger.info(s"Declining offer with $offerId")
-        val decline = s"""
-                         |{
-                         |  "framework_id"    : {"value" : "84b4efc0-545c-485c-a044-7c8e52b67379-1111"},
-                         |  "type"            : "DECLINE",
-                         |  "decline"         : {
-                         |    "offer_ids" : [
-                         |                   {"value" : "$offerId"}
-                         |                  ],
-                         |    "filters"   : {"refuse_seconds" : 5.0}
-                         |  }
-                         |}""".stripMargin
+
+        val decline = client.decline(
+          frameworkId = frameworkID,
+          offerIds = Seq(offerId),
+          filters = Some(Filters(Some(5.0f)))
+        )
         Source.single(decline).runWith(client.mesosSink)
       }
 
