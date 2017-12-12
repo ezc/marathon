@@ -371,10 +371,9 @@ trait MesosApi {
 
 // TODO: PLAN:
 // TODO: ====================================================================================
-// TODO: Set FrameworkInfo on SUBSCRIBE request
-// TODO: Switch from `application/json` to `application/x-protobuf`
 // TODO: Add ITs
 // TODO: Add README.md
+// TODO: Move header related fields(e.g. ProtoContentType) to it's own class
 
 object MesosClient extends StrictLogging {
 
