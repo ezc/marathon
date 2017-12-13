@@ -27,10 +27,10 @@ class MesosClient(
     implicit val executionContext: ExecutionContext
 ) extends MesosApi with StrictLogging {
 
-  val overflowStrategy = akka.stream.OverflowStrategy.backpressure
+  private val overflowStrategy = akka.stream.OverflowStrategy.backpressure
 
-  val mesosStreamIdPromise = Promise[String]()
-  val mesosStreamId: Future[String] = mesosStreamIdPromise.future
+  private val mesosStreamIdPromise = Promise[String]()
+  private val mesosStreamId: Future[String] = mesosStreamIdPromise.future
 
   /** It is declared lazy to decouple instantiation of the MesosClient instance from connection initialization. */
   override lazy val mesosSource: Source[Event, NotUsed] = {
@@ -363,13 +363,20 @@ trait MesosApi {
 
 }
 
-// TODO: PLAN:
-// TODO: ====================================================================================
-// TODO: Add ITs
+// TODO: Add more integration tests
+// TODO: Handle redirects when connecting to mesos master
+// TODO: Add handling missing HEARTBEATS events
 // TODO: Add README.md
 
 object MesosClient extends StrictLogging {
 
+  /** Run Foo framework that:
+    *  - successfully subscribes
+    *  - declines first offer it gets
+    *
+    *  Not much, but shows the basic idea. Good to test against local mesos.
+    *
+    */
   def main(args: Array[String]): Unit = {
     implicit val system = ActorSystem()
     implicit val materializer = ActorMaterializer()
@@ -384,7 +391,7 @@ object MesosClient extends StrictLogging {
       capabilities = Seq(FrameworkInfo.Capability(`type` = Some(FrameworkInfo.Capability.Type.MULTI_ROLE)))
     )
 
-    val conf = new MesosConf(args)
+    val conf = new MesosConf(List("--master", s"127.0.0.1:5050"))
     val client = new MesosClient(conf, frameworkInfo)
 
     client.mesosSource.runWith(Sink.foreach { event =>
