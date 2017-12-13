@@ -2,7 +2,6 @@ package mesosphere.mesos.client
 
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
-import akka.http.scaladsl.model.MediaType.Compressible
 import akka.http.scaladsl.model._
 import akka.stream.ActorMaterializer
 import akka.stream.alpakka.recordio.scaladsl.RecordIOFraming
@@ -15,6 +14,7 @@ import org.apache.mesos.v1.mesos._
 import org.apache.mesos.v1.scheduler.scheduler.{Call, Event}
 import org.apache.mesos.v1.scheduler.scheduler.Call.{Accept, Acknowledge, Decline, Kill, Message, Reconcile, Revive}
 import com.google.protobuf
+import mesosphere.mesos.client.MesosStreamSupport._
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
@@ -22,17 +22,13 @@ import scala.util.{Failure, Success}
 class MesosClient(
     conf: MesosConf,
     frameworkInfo: FrameworkInfo)(
-    implicit
-    val system: ActorSystem,
+    implicit val system: ActorSystem,
     implicit val materializer: ActorMaterializer,
     implicit val executionContext: ExecutionContext
 ) extends MesosApi with StrictLogging {
 
-  val Array(host, port) = conf.mesosMaster().split(":")
-
   val overflowStrategy = akka.stream.OverflowStrategy.backpressure
 
-  val mesosStreamIdHeader = "Mesos-Stream-Id"
   val mesosStreamIdPromise = Promise[String]()
   val mesosStreamId: Future[String] = mesosStreamIdPromise.future
 
@@ -47,7 +43,8 @@ class MesosClient(
       entity = HttpEntity(ProtobufMediaType, body),
       headers = List(headers.Accept(ProtobufMediaType)))
 
-    val httpConnection: Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] = Http().outgoingConnection(host, port.toInt)
+    val httpConnection: Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] = Http()
+      .outgoingConnection(conf.mesosMasterHost, conf.mesosMasterPort)
 
     /**
       * Inbound traffic is handled via a persistent connection to the `/api/v1/scheduler` endpoint.
@@ -63,13 +60,13 @@ class MesosClient(
         case StatusCodes.OK =>
           logger.info(s"Connected successfully to ${conf.mesosMaster()}");
           val mesosStreamId = resp.headers
-            .find(_.name() == mesosStreamIdHeader)
+            .find(_.name() == MesosStreamIdHeader)
             .map(_.value())
             .getOrElse(throw new IllegalStateException(s"Missing MesosStreamId header in ${resp.headers}"))
           mesosStreamIdPromise.success(mesosStreamId)
           resp
         case StatusCodes.TemporaryRedirect =>
-          throw new IllegalArgumentException(s"${conf.mesosMaster} is unavailable") // Handle a redirect to a current leader
+          throw new IllegalArgumentException(s"${conf.mesosMaster()} is unavailable") // TODO: Handle a redirect to a current leader
         case _ =>
           throw new IllegalArgumentException(s"Mesos server error: $resp")
       }
@@ -82,7 +79,7 @@ class MesosClient(
     def log[T](prefix: String): Flow[T, T, NotUsed] = Flow[T].map{ e => logger.info(s"$prefix$e"); e }
 
     val flow = Flow[HttpRequest]
-      .via(log(s"Connecting to mesos master: $host:$port"))
+      .via(log(s"Connecting to mesos master: ${conf.mesosMaster()}"))
       .via(httpConnection)
       .via(log("HttpResponse: "))
       .via(connectionHandler)
@@ -96,9 +93,6 @@ class MesosClient(
       .toMat(BroadcastHub.sink)(Keep.right).run()
   }
 
-  val ProtobufMediaType: MediaType.Binary = MediaType.applicationBinary("x-protobuf", Compressible)
-  val ProtobufContentType: ContentType = ContentType.Binary(ProtobufMediaType)
-
 
   // A sink for mesos events. We use `Http().singleRequest()` method thus creating a new HTTP request every time.
   private val sink: Sink[(String, Call), Future[Done]] = Sink.foreach[(String, Call)]{
@@ -108,7 +102,7 @@ class MesosClient(
 
       val request = HttpRequest(
         HttpMethods.POST,
-        uri = Uri(s"http://$host:$port/api/v1/scheduler"),
+        uri = Uri(s"http://${conf.mesosMaster()}/api/v1/scheduler"),
         entity = HttpEntity(ProtobufMediaType, call.toByteArray),
         headers = List(headers.RawHeader("Mesos-Stream-Id", mesosStreamId)))
 
@@ -373,7 +367,6 @@ trait MesosApi {
 // TODO: ====================================================================================
 // TODO: Add ITs
 // TODO: Add README.md
-// TODO: Move header related fields(e.g. ProtoContentType) to it's own class
 
 object MesosClient extends StrictLogging {
 

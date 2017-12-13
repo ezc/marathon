@@ -14,4 +14,8 @@ class MesosConf(args: Seq[String]) extends ScallopConf(args) {
     noshort = true)
 
   verify()
+
+  val mesosMasterHost:String = mesosMaster().split(":")(0)
+
+  val mesosMasterPort:Int = mesosMaster().split(":")(1).toInt
 }
