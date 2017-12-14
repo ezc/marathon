@@ -13,6 +13,15 @@ class MesosConf(args: Seq[String]) extends ScallopConf(args) {
     required = true,
     noshort = true)
 
+  val sourceBufferSize = opt[Int](
+    "buffer_size",
+    descr = "Buffer size of the mesos source",
+    required = false,
+    noshort = true,
+    hidden = true,
+    default = Some(10)
+  )
+
   verify()
 
   val mesosMasterHost:String = mesosMaster().split(":")(0)

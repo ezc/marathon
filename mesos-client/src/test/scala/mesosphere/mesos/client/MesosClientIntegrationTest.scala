@@ -1,5 +1,7 @@
 package mesosphere.mesos.client
 
+import java.util.UUID
+
 import akka.actor.ActorSystem
 import akka.stream.ActorMaterializer
 import akka.stream.scaladsl.Sink
@@ -14,7 +16,6 @@ import org.scalatest.Inside
 import org.scalatest.concurrent.Eventually
 
 import scala.concurrent.Future
-import scala.util.Success
 
 @IntegrationTest
 class MesosClientIntegrationTest extends AkkaUnitTest
@@ -23,52 +24,61 @@ class MesosClientIntegrationTest extends AkkaUnitTest
   with Inside
   with StrictLogging {
 
-  "Mesos client should successfully subscribe to mesos" in {
-    val f = new Fixture()
+  "Mesos client should successfully subscribe to mesos without framework Id" in withFixture() { f =>
 
     val res: Future[Seq[Event]] = f.client.mesosSource.take(1).runWith(Sink.seq)
-    eventually {
-      inside(res.value) {
-        case Some(Success(events)) =>
+    inside(res.futureValue) {
+      case events =>
+        events.head.`type` shouldBe Some(Event.Type.SUBSCRIBED)
+    }
+  }
+
+  "Mesos client should successfully subscribe to mesos with framework Id" in {
+    val frameworkID = FrameworkID(UUID.randomUUID().toString)
+
+    withFixture(Some(frameworkID)) { f =>
+      val res: Future[Seq[Event]] = f.client.mesosSource.take(1).runWith(Sink.seq)
+      inside(res.futureValue) {
+        case events =>
           events.head.`type` shouldBe Some(Event.Type.SUBSCRIBED)
+          events.head.subscribed.get.frameworkId shouldBe frameworkID
       }
     }
   }
 
-  "Mesos client should successfully receive heartbeats" in {
-    val f = new Fixture()
-
+  "Mesos client should successfully receive heartbeats" in withFixture() { f =>
     val res: Future[Seq[Event]] = f.client.mesosSource.take(2).runWith(Sink.seq)
-    eventually {
-      inside(res.value) {
-        case Some(Success(events)) =>
-          events.filter(_.`type` == Some(Event.Type.HEARTBEAT)).size should be > 0
-      }
+    inside(res.futureValue) {
+      case events =>
+        events.filter(_.`type` == Some(Event.Type.HEARTBEAT)).size should be > 0
     }
   }
 
-  "Mesos client should successfully receive offers" in {
-    val f = new Fixture()
-
+  "Mesos client should successfully receive offers" in withFixture() { f =>
     val res: Future[Seq[Event]] = f.client.mesosSource.take(3).runWith(Sink.seq)
-    eventually {
-      inside(res.value) {
-        case Some(Success(events)) =>
-          events.filter(_.`type` == Some(Event.Type.OFFERS)).size should be > 0
-      }
+    inside(res.futureValue) {
+      case events =>
+        events.filter(_.`type` == Some(Event.Type.OFFERS)).size should be > 0
     }
   }
 
-  class Fixture() {
+  def withFixture(frameworkId: Option[FrameworkID] = None)(fn: Fixture => Unit): Unit = {
+    val f = new Fixture(frameworkId)
+    try (fn(f)) finally {
+      f.client.killSwitch.shutdown()
+    }
+  }
+
+  class Fixture(frameworkId: Option[FrameworkID] = None) {
     implicit val system = ActorSystem()
     implicit val materializer = ActorMaterializer()
 
-    val frameworkID = FrameworkID("84b4efc0-545c-485c-a044-7c8e52b67379-1111")
     val frameworkInfo = FrameworkInfo(
       user = "foo",
       name = "Example FOO Framework",
-      id = Some(frameworkID),
+      id = frameworkId,
       roles = Seq("foo"),
+      failoverTimeout = Some(0.0f),
       capabilities = Seq(FrameworkInfo.Capability(`type` = Some(FrameworkInfo.Capability.Type.MULTI_ROLE)))
     )
 

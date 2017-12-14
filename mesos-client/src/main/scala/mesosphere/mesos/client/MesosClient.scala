@@ -3,20 +3,21 @@ package mesosphere.mesos.client
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
-import akka.stream.ActorMaterializer
 import akka.stream.alpakka.recordio.scaladsl.RecordIOFraming
 import akka.stream.scaladsl._
+import akka.stream.{ActorMaterializer, KillSwitches, UniqueKillSwitch}
 import akka.util.ByteString
 import akka.{Done, NotUsed}
+import com.google.protobuf
 import com.typesafe.scalalogging.StrictLogging
+import mesosphere.mesos.client.MesosStreamSupport._
 import mesosphere.mesos.conf.MesosConf
 import org.apache.mesos.v1.mesos._
-import org.apache.mesos.v1.scheduler.scheduler.{Call, Event}
 import org.apache.mesos.v1.scheduler.scheduler.Call.{Accept, Acknowledge, Decline, Kill, Message, Reconcile, Revive}
-import com.google.protobuf
-import mesosphere.mesos.client.MesosStreamSupport._
+import org.apache.mesos.v1.scheduler.scheduler.{Call, Event}
 
-import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.duration.Duration
+import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
 class MesosClient(
@@ -33,7 +34,7 @@ class MesosClient(
   private val mesosStreamId: Future[String] = mesosStreamIdPromise.future
 
   /** It is declared lazy to decouple instantiation of the MesosClient instance from connection initialization. */
-  override lazy val mesosSource: Source[Event, NotUsed] = {
+  lazy val source: Source[Event, NotUsed] = {
 
     val body = subscribe(frameworkInfo).toByteArray
 
@@ -78,20 +79,22 @@ class MesosClient(
 
     def log[T](prefix: String): Flow[T, T, NotUsed] = Flow[T].map{ e => logger.info(s"$prefix$e"); e }
 
-    val flow = Flow[HttpRequest]
+    Source.single(request)
       .via(log(s"Connecting to mesos master: ${conf.mesosMaster()}"))
       .via(httpConnection)
       .via(log("HttpResponse: "))
       .via(connectionHandler)
+      .buffer(conf.sourceBufferSize(), overflowStrategy)
       .via(dataBytesExtractor)
       .via(recordIoScanner)
       .via(eventDeserializer)
       .via(log("Received mesos Event: "))
-
-    Source.single(request)
-      .via(flow)
-      .toMat(BroadcastHub.sink)(Keep.right).run()
   }
+
+  override lazy val (killSwitch: UniqueKillSwitch, mesosSource: Source[Event, NotUsed]) = source
+    .viaMat(KillSwitches.single)(Keep.right)
+    .toMat(BroadcastHub.sink)(Keep.both)
+    .run()
 
 
   // A sink for mesos events. We use `Http().singleRequest()` method thus creating a new HTTP request every time.
@@ -155,6 +158,14 @@ trait MesosApi {
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#calls
     */
   def mesosSink: Sink[Call, NotUsed]
+
+  /**
+    * A kill switch for the mesos source. Calling `shutdown()` or `abort()` on it will close the connection to mesos.
+    * Note that depending on `failoverTimeout` provided with SUBSCRIBED call mesos could start killing tasks and
+    * executors started by the framework. Make sure to set `failoverTimeout` appropriately. See `teardown()` method
+    * for another way to shutdown a framework.
+    */
+  val killSwitch: UniqueKillSwitch
 
   /** ***************************************************************************
     * Helper methods to create mesos `Call`s
@@ -382,11 +393,9 @@ object MesosClient extends StrictLogging {
     implicit val materializer = ActorMaterializer()
     implicit val executionContext = system.dispatcher
 
-    val frameworkID = FrameworkID("84b4efc0-545c-485c-a044-7c8e52b67379-1111")
     val frameworkInfo = FrameworkInfo(
       user = "foo",
       name = "Example FOO Framework",
-      id = Some(frameworkID),
       roles = Seq("test"),
       capabilities = Seq(FrameworkInfo.Capability(`type` = Some(FrameworkInfo.Capability.Type.MULTI_ROLE)))
     )
@@ -394,13 +403,19 @@ object MesosClient extends StrictLogging {
     val conf = new MesosConf(List("--master", s"127.0.0.1:5050"))
     val client = new MesosClient(conf, frameworkInfo)
 
+    val frameworkIDP = Promise[FrameworkID]()
+    val frameworkIDF = frameworkIDP.future
+
     client.mesosSource.runWith(Sink.foreach { event =>
 
-      // Test case: decline first offer received
-      if (event.`type`.get == Event.Type.OFFERS) {
+      if (event.`type`.get == Event.Type.SUBSCRIBED) {  // Save frameworkdId received
+        frameworkIDP.success(event.subscribed.get.frameworkId)
+      }
+      else if (event.`type`.get == Event.Type.OFFERS) { // Test case: decline first offer received
         val offerId = event.offers.get.offers.head.id
         logger.info(s"Declining offer with $offerId")
 
+        val frameworkID = Await.result(frameworkIDF, Duration.Inf)  // Should be instant and in the same thread since frameworkIDF is already completed
         val decline = client.decline(
           frameworkId = frameworkID,
           offerIds = Seq(offerId),
