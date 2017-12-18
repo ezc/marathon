@@ -8,7 +8,7 @@ import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
 import akka.stream.alpakka.recordio.scaladsl.RecordIOFraming
 import akka.stream.scaladsl._
-import akka.stream.{ActorMaterializer, KillSwitches, UniqueKillSwitch}
+import akka.stream._
 import akka.util.ByteString
 import akka.{Done, NotUsed}
 import com.google.protobuf
@@ -77,11 +77,13 @@ class MesosClient(
           response
         case StatusCodes.TemporaryRedirect =>
           val leader = new URI(response.header[headers.Location].get.value())
+          logger.warn(s"New mesos leader available at $leader")
           // Schedulers are expected to make HTTP requests to the leading master. If requests are made to a
           // non-leading master a “HTTP 307 Temporary Redirect” will be received with the “Location” header
           // pointing to the leading master.
-          // We throw a MesosRedicrectException here with the new leader address and handle it in the
-          // `recoverWithRetries` stage by building a flow that reconnects to the new leader.
+          // We update connection context with the new leader address and throw a MesosRedicrectException
+          // which is handled it in the `recoverWithRetries` stage by building a new flow that reconnects
+          // to the new leader.
           context.updateAndGet(c => c.copy(host = leader.getHost, port = leader.getPort))
           throw new MesosRedicrectException(leader)
         case _ =>
@@ -93,23 +95,18 @@ class MesosClient(
 
     val eventDeserializer: Flow[ByteString, Event, NotUsed] = Flow[ByteString].map(bytes => Event.parseFrom(bytes.toArray))
 
-    val ctx = context.get()
+    val heartbeatFilter: Flow[Event, Event, NotUsed] = Flow[Event].filterNot(e => e.`type`.exists(_.isHeartbeat))
 
-    Source.single(request)
-      .via(log(s"Connecting to mesos master: ${ctx.url}"))
-      .via(httpConnection(ctx.host, ctx.port))
+    def connectionSource(host: String, port: Int) =
+      Source.single(request)
+      .via(log(s"Connecting to the new leader: $host:$port"))
+      .via(httpConnection(host, port))
       .via(log("HttpResponse: "))
       .via(connectionHandler)
-      .recoverWithRetries(conf.redirectRetires(), {
-        case MesosRedicrectException(leader) =>
-          logger.warn(s"New mesos leader available at $leader")
 
-          // Build a new flow with a request to the new leader.
-          Source.single(request)
-            .via(log(s"Connecting to the new leader: $leader"))
-            .via(httpConnection(leader.getHost, leader.getPort))
-            .via(log("HttpResponse: "))
-            .via(connectionHandler)
+    connectionSource(context.get().host, context.get().port)
+      .recoverWithRetries(conf.redirectRetires(), {
+        case MesosRedicrectException(_) => connectionSource(context.get().host, context.get().port)
       })
       .idleTimeout(conf.idleTimeout().seconds)
       .buffer(conf.sourceBufferSize(), overflowStrategy)
