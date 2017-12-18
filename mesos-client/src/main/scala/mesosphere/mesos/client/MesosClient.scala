@@ -1,5 +1,8 @@
 package mesosphere.mesos.client
 
+import java.net.URI
+import java.util.concurrent.atomic.AtomicReference
+
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
@@ -16,7 +19,7 @@ import org.apache.mesos.v1.mesos._
 import org.apache.mesos.v1.scheduler.scheduler.Call.{Accept, Acknowledge, Decline, Kill, Message, Reconcile, Revive}
 import org.apache.mesos.v1.scheduler.scheduler.{Call, Event}
 
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
@@ -30,8 +33,8 @@ class MesosClient(
 
   private val overflowStrategy = akka.stream.OverflowStrategy.backpressure
 
-  private val mesosStreamIdPromise = Promise[String]()
-  private val mesosStreamId: Future[String] = mesosStreamIdPromise.future
+  val context = new AtomicReference[ConnectionContext](ConnectionContext(conf))
+  val contextPromise = Promise[ConnectionContext]()
 
   /** It is declared lazy to decouple instantiation of the MesosClient instance from connection initialization. */
   lazy val source: Source[Event, NotUsed] = {
@@ -44,8 +47,10 @@ class MesosClient(
       entity = HttpEntity(ProtobufMediaType, body),
       headers = List(headers.Accept(ProtobufMediaType)))
 
-    val httpConnection: Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] = Http()
-      .outgoingConnection(conf.mesosMasterHost, conf.mesosMasterPort)
+    def log[T](prefix: String): Flow[T, T, NotUsed] = Flow[T].map{ e => logger.info(s"$prefix$e"); e }
+
+    def httpConnection(host: String, port: Int): Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] =
+      Http().outgoingConnection(host, port)
 
     /**
       * Inbound traffic is handled via a persistent connection to the `/api/v1/scheduler` endpoint.
@@ -56,20 +61,31 @@ class MesosClient(
       */
     val recordIoScanner: Flow[ByteString, ByteString, NotUsed] = RecordIOFraming.scanner()
 
-    val connectionHandler: Flow[HttpResponse, HttpResponse, NotUsed] = Flow[HttpResponse].map { resp =>
-      resp.status match {
+    val connectionHandler: Flow[HttpResponse, HttpResponse, NotUsed] = Flow[HttpResponse].map { response =>
+      response.status match {
         case StatusCodes.OK =>
-          logger.info(s"Connected successfully to ${conf.mesosMaster()}");
-          val mesosStreamId = resp.headers
-            .find(_.name() == MesosStreamIdHeader)
-            .map(_.value())
-            .getOrElse(throw new IllegalStateException(s"Missing MesosStreamId header in ${resp.headers}"))
-          mesosStreamIdPromise.success(mesosStreamId)
-          resp
+          logger.info(s"Connected successfully to ${context.get().url}");
+          val streamId = response.headers
+            .find(h => h.is(MesosStreamIdHeaderName.toLowerCase))
+            .getOrElse(throw new IllegalStateException(s"Missing MesosStreamId header in ${response.headers}"))
+
+          // At this point we successfully connected to mesos leader so context should have correct leader's host
+          // and port either from the config or set on the redirect.
+          val ctx = context.updateAndGet(c => c.copy(mesosStreamId = streamId.value()))
+          contextPromise.success(ctx)
+
+          response
         case StatusCodes.TemporaryRedirect =>
-          throw new IllegalArgumentException(s"${conf.mesosMaster()} is unavailable") // TODO: Handle a redirect to a current leader
+          val leader = new URI(response.header[headers.Location].get.value())
+          // Schedulers are expected to make HTTP requests to the leading master. If requests are made to a
+          // non-leading master a “HTTP 307 Temporary Redirect” will be received with the “Location” header
+          // pointing to the leading master.
+          // We throw a MesosRedicrectException here with the new leader address and handle it in the
+          // `recoverWithRetries` stage by building a flow that reconnects to the new leader.
+          context.updateAndGet(c => c.copy(host = leader.getHost, port = leader.getPort))
+          throw new MesosRedicrectException(leader)
         case _ =>
-          throw new IllegalArgumentException(s"Mesos server error: $resp")
+          throw new IllegalArgumentException(s"Mesos server error: $response")
       }
     }
 
@@ -77,13 +93,25 @@ class MesosClient(
 
     val eventDeserializer: Flow[ByteString, Event, NotUsed] = Flow[ByteString].map(bytes => Event.parseFrom(bytes.toArray))
 
-    def log[T](prefix: String): Flow[T, T, NotUsed] = Flow[T].map{ e => logger.info(s"$prefix$e"); e }
+    val ctx = context.get()
 
     Source.single(request)
-      .via(log(s"Connecting to mesos master: ${conf.mesosMaster()}"))
-      .via(httpConnection)
+      .via(log(s"Connecting to mesos master: ${ctx.url}"))
+      .via(httpConnection(ctx.host, ctx.port))
       .via(log("HttpResponse: "))
       .via(connectionHandler)
+      .recoverWithRetries(conf.redirectRetires(), {
+        case MesosRedicrectException(leader) =>
+          logger.warn(s"New mesos leader available at $leader")
+
+          // Build a new flow with a request to the new leader.
+          Source.single(request)
+            .via(log(s"Connecting to the new leader: $leader"))
+            .via(httpConnection(leader.getHost, leader.getPort))
+            .via(log("HttpResponse: "))
+            .via(connectionHandler)
+      })
+      .idleTimeout(conf.idleTimeout().seconds)
       .buffer(conf.sourceBufferSize(), overflowStrategy)
       .via(dataBytesExtractor)
       .via(recordIoScanner)
@@ -98,16 +126,16 @@ class MesosClient(
 
 
   // A sink for mesos events. We use `Http().singleRequest()` method thus creating a new HTTP request every time.
-  private val sink: Sink[(String, Call), Future[Done]] = Sink.foreach[(String, Call)]{
-    case (mesosStreamId, call) =>
+  private val sink: Sink[(ConnectionContext, Call), Future[Done]] = Sink.foreach[(ConnectionContext, Call)]{
+    case (ctx, call) =>
 
-      logger.info(s"Sending: $call")
+      logger.info(s"Sending: $call to ${ctx.url}")
 
       val request = HttpRequest(
         HttpMethods.POST,
-        uri = Uri(s"http://${conf.mesosMaster()}/api/v1/scheduler"),
+        uri = Uri(s"http://${ctx.url}/api/v1/scheduler"),
         entity = HttpEntity(ProtobufMediaType, call.toByteArray),
-        headers = List(headers.RawHeader("Mesos-Stream-Id", mesosStreamId)))
+        headers = List(MesosStreamIdHeader(ctx.mesosStreamId)))
 
       Http().singleRequest(request).map{ response =>
         logger.info(s"Response: $response")
@@ -118,7 +146,7 @@ class MesosClient(
   // Attach a MergeHub Source to mesos sink. This will materialize to a corresponding Sink.
   private val hub: RunnableGraph[Sink[Call, NotUsed]] =
     MergeHub.source[Call](perProducerBufferSize = 16)
-      .mapAsync(1)(e => mesosStreamId.map(id => (id, e)))
+      .mapAsync(1)(event => contextPromise.future.map(ctx => (ctx, event)))
       .to(sink)
 
   // By running/materializing the consumer we get back a Sink, and hence now have access to feed elements into it.
@@ -375,8 +403,6 @@ trait MesosApi {
 }
 
 // TODO: Add more integration tests
-// TODO: Handle redirects when connecting to mesos master
-// TODO: Add handling missing HEARTBEATS events
 // TODO: Add README.md
 
 object MesosClient extends StrictLogging {

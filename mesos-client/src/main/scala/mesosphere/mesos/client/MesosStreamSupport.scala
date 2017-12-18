@@ -1,11 +1,12 @@
 package mesosphere.mesos.client
 
-import akka.http.scaladsl.model.{ContentType, MediaType}
 import akka.http.scaladsl.model.MediaType.Compressible
+import akka.http.scaladsl.model.{ContentType, MediaType, headers}
 
 object MesosStreamSupport {
 
-  val MesosStreamIdHeader = "Mesos-Stream-Id"
+  val MesosStreamIdHeaderName = "Mesos-Stream-Id"
+  def MesosStreamIdHeader(streamId: String) = headers.RawHeader("Mesos-Stream-Id", streamId)
   val ProtobufMediaType: MediaType.Binary = MediaType.applicationBinary("x-protobuf", Compressible)
   val ProtobufContentType: ContentType = ContentType.Binary(ProtobufMediaType)
 }

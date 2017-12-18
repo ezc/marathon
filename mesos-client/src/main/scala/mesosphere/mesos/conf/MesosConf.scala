@@ -15,16 +15,34 @@ class MesosConf(args: Seq[String]) extends ScallopConf(args) {
 
   val sourceBufferSize = opt[Int](
     "buffer_size",
-    descr = "Buffer size of the mesos source",
+    descr = "Buffer size of the mesos source im messages",
     required = false,
     noshort = true,
     hidden = true,
     default = Some(10)
   )
 
+  val redirectRetires = opt[Int](
+    "redirect_retries",
+    descr = "Number of retries to follow mesos master redirect",
+    required = false,
+    noshort = true,
+    hidden = true,
+    default = Some(3)
+  )
+
+  val idleTimeout = opt[Int](
+    "idle_timeout",
+    descr = "Time in seconds between two processed elements exceeds the provided timeout then the connection to mesos " +
+      "is interrupted. Is usually set to approx. 5 hear beats.",
+    required = false,
+    noshort = true,
+    default = Some(75)
+  )
+
   verify()
 
-  val mesosMasterHost:String = mesosMaster().split(":")(0)
-
-  val mesosMasterPort:Int = mesosMaster().split(":")(1).toInt
+  private val mesosMasterUri: java.net.URI = new java.net.URI(s"my://${mesosMaster()}")
+  val mesosMasterHost: String = mesosMasterUri.getHost()
+  val mesosMasterPort: Int = mesosMasterUri.getPort()
 }
