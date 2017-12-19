@@ -36,7 +36,74 @@ class MesosClient(
   val context = new AtomicReference[ConnectionContext](ConnectionContext(conf))
   val contextPromise = Promise[ConnectionContext]()
 
-  /** It is declared lazy to decouple instantiation of the MesosClient instance from connection initialization. */
+  /**
+    Mesos source is an akka-stream `Source[Event, NotUsed]` that frameworks can attach to, to receive mesos event.
+    Basic flow visualized looks like following
+
+     ------------
+    | Http       | (1)
+    | Connection |
+     ------------
+          |
+          v
+     ------------
+    | Connection | (2)
+    | Handler    |     -> updates connection context
+     ------------
+          |
+          v
+     ------------
+    | Data Bytes | (3)
+    | Extractor  |
+     ------------
+          |
+          v
+     ------------
+    | RecordIO   | (4)
+    | Scanner    |
+     ------------
+          |
+          v
+     --------------
+    | Event        | (5)
+    | Deserializer |
+     --------------
+          |
+          v
+     --------------
+    | BroadcastHub | (6)
+     --------------
+      |  |  |  |  |
+      v  v  v  v  v
+
+    1. Http Connection mesos-v1-client uses akka-http low-level `Http.outgoingConnection()` to `POST` a
+       [SUBSCRIBE](http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1) request to mesos `api/v1/scheduler`
+       endpoint providing framework info. The HTTP response is a stream in RecordIO format which is handled by the later stages.
+    2. Connection Handler handles connection HTTP response, saving `Mesos-Stream-Id`(see the description of the
+       [SUBSCRIBE](http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1) call) in client's _connection context_
+       object to later use it in mesos sink. Schedulers are expected to make HTTP requests to the leading master. If requests are made
+       to a non-leading master a `HTTP 307 Temporary Redirect` will be received with the `Location` header pointing to the leading master.
+       We update connection context with the new leader address and throw a `MesosRedicrectException` which is handled it in the `recover`
+       stage by building a new flow that reconnects to the new leader.
+    3. Data Byte Extractor simply extracts byte data from the response body
+    4. RecordIO Scanner Each stream message is encoded in RecordIO format, which essentially prepends to a single record (either JSON or
+       serialized protobuf) its length in bytes: `[<length>\n<json string|protobuf bytes>]`. More about the format
+       [here](http://mesos.apache.org/documentation/latest/scheduler-http-api/#recordio-response-format-1). RecordIO Scanner uses
+       `RecordIOFraming.Scanner` from the [alpakka-library](https://github.com/akka/alpakka) to parse the extracted bytes into a complete
+       message frame.
+    5. Event Deserializer Currently mesos-v1-client only supports protobuf encoded events/calls. Event deserializer uses
+       [scalapb](https://scalapb.github.io/) library to parse the extracted RecordIO frame from the previous stage into a mesos
+       [Event](https://github.com/apache/mesos/blob/master/include/mesos/scheduler/scheduler.proto#L36)
+    6. BroadcastHub ad the end the flow is going through a broadcast hub. This allows for a dynamic "fan-out" streaming of events and avoids
+       making multiple upstream connections to mesos when the source is materialized by multiple event consumers.
+
+    Note: _Connection Handler_ updates the _connection context_ object with current mesos leader `host` and `port` along with `Mesos-Stream-Id`
+    header value. These settings are used by mesos sink when sending calls to mesos.
+
+    It is declared lazy to decouple instantiation of the MesosClient instance from connection initialization.
+    */
+  def log[T](prefix: String): Flow[T, T, NotUsed] = Flow[T].map{ e => logger.info(s"$prefix$e"); e }
+
   lazy val source: Source[Event, NotUsed] = {
 
     val body = subscribe(frameworkInfo).toByteArray
@@ -47,18 +114,9 @@ class MesosClient(
       entity = HttpEntity(ProtobufMediaType, body),
       headers = List(headers.Accept(ProtobufMediaType)))
 
-    def log[T](prefix: String): Flow[T, T, NotUsed] = Flow[T].map{ e => logger.info(s"$prefix$e"); e }
-
     def httpConnection(host: String, port: Int): Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] =
       Http().outgoingConnection(host, port)
 
-    /**
-      * Inbound traffic is handled via a persistent connection to the `/api/v1/scheduler` endpoint.
-      * Each message is encoded in RecordIO format, which essentially prepends to a single record
-      * (either JSON or serialized protobuf) its length in bytes: [<length>\n<json string|protobuf bytes>]
-      *
-      * http://mesos.apache.org/documentation/latest/scheduler-http-api/#recordio-response-format-1
-      */
     val recordIoScanner: Flow[ByteString, ByteString, NotUsed] = RecordIOFraming.scanner()
 
     val connectionHandler: Flow[HttpResponse, HttpResponse, NotUsed] = Flow[HttpResponse].map { response =>
@@ -78,12 +136,8 @@ class MesosClient(
         case StatusCodes.TemporaryRedirect =>
           val leader = new URI(response.header[headers.Location].get.value())
           logger.warn(s"New mesos leader available at $leader")
-          // Schedulers are expected to make HTTP requests to the leading master. If requests are made to a
-          // non-leading master a “HTTP 307 Temporary Redirect” will be received with the “Location” header
-          // pointing to the leading master.
-          // We update connection context with the new leader address and throw a MesosRedicrectException
-          // which is handled it in the `recoverWithRetries` stage by building a new flow that reconnects
-          // to the new leader.
+          // Update the context with the new leader's host and port and throw an exception that is handled in the
+          // next `recoverWith` stage.
           context.updateAndGet(c => c.copy(host = leader.getHost, port = leader.getPort))
           throw new MesosRedicrectException(leader)
         case _ =>
@@ -122,28 +176,59 @@ class MesosClient(
     .run()
 
 
-  // A sink for mesos events. We use `Http().singleRequest()` method thus creating a new HTTP request every time.
-  private val sink: Sink[(ConnectionContext, Call), Future[Done]] = Sink.foreach[(ConnectionContext, Call)]{
-    case (ctx, call) =>
+  /**
+  Mesos sink is an akka-stream `Sink[Call, Notused]` that sends calls to mesos. Every call is send via a new (and pooled) connection.
+  The flow visualized:
 
-      logger.info(s"Sending: $call to ${ctx.url}")
+       |  |  |
+       v  v  v
+      ----------
+     | MergeHub | (1)
+      ----------
+          |
+          v
+     ------------
+    | Event      |
+    | Serializer | (2)
+     ------------
+          |
+          v
+     ------------
+    | Http Sink  | (3)
+     ------------
 
-      val request = HttpRequest(
-        HttpMethods.POST,
-        uri = Uri(s"http://${ctx.url}/api/v1/scheduler"),
-        entity = HttpEntity(ProtobufMediaType, call.toByteArray),
-        headers = List(MesosStreamIdHeader(ctx.mesosStreamId)))
+    1. MergeHub allows dynamic "fan-in" junction point for mesos calls from multiple producers.
+    2. Event Serializer serializes calls to byte array
+    3. Http Sink creates a new connection using akka's `Http().singleRequest` and sends the data
 
-      Http().singleRequest(request).map{ response =>
-        logger.info(s"Response: $response")
-        response.discardEntityBytes()
-      }
+    Note: Merge hub will wait for the _connection context_ object to be fully initialized first meaning that we have current leader's
+    `host`, `port` and `Mesos-Stream-Id` to send the events to.
+    */
+  private val sink: Sink[(ConnectionContext, Array[Byte]), Future[Done]] = Sink.foreach[(ConnectionContext, Array[Byte])]{
+    case (ctx, bytes) =>
+
+      Http()
+        .singleRequest(
+          HttpRequest(
+            HttpMethods.POST,
+            uri = Uri(s"http://${ctx.url}/api/v1/scheduler"),
+            entity = HttpEntity(ProtobufMediaType, bytes),
+            headers = List(MesosStreamIdHeader(ctx.mesosStreamId))))
+        .map { response =>
+          logger.info(s"Response: $response")
+          response.discardEntityBytes()
+        }
   }
+
+  private val eventSerializer: Flow[(ConnectionContext, Call), (ConnectionContext, Array[Byte]), NotUsed] = Flow[(ConnectionContext, Call)]
+    .map { case (ctx, call) => (ctx, call.toByteArray) }
 
   // Attach a MergeHub Source to mesos sink. This will materialize to a corresponding Sink.
   private val hub: RunnableGraph[Sink[Call, NotUsed]] =
     MergeHub.source[Call](perProducerBufferSize = 16)
       .mapAsync(1)(event => contextPromise.future.map(ctx => (ctx, event)))
+      .via(log("Sending "))
+      .via(eventSerializer)
       .to(sink)
 
   // By running/materializing the consumer we get back a Sink, and hence now have access to feed elements into it.
@@ -400,7 +485,6 @@ trait MesosApi {
 }
 
 // TODO: Add more integration tests
-// TODO: Add README.md
 
 object MesosClient extends StrictLogging {
 
