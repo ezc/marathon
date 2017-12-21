@@ -69,12 +69,19 @@ Mesos sink is an akka-stream `Sink[Call, Notused]` that sends calls to mesos. Ev
       |
       v
  ------------
-| Http Sink  | (3)
+| Request    |
+| Builder    | (3)
+ ------------
+      |
+      v
+ ------------
+| Http Sink  | (4)
  ------------
 ```
 1. **MergeHub** allows dynamic "fan-in" junction point for mesos calls from multiple producers.
 2. **Event Serializer** serializes calls to byte array
-3. **Http Sink** creates a new connection using akka's `Http().singleRequest` and sends the data
+3. **Request Builder** builds a HTTP request from the data using `mesosStreamId` header from the context
+4. **Http Sink** creates a new connection using akka's `Http().singleRequest` and sends the data
 
 Note: Merge hub will wait for the _connection context_ object to be fully initialized first meaning that we have current leader's `host`, `port` and `Mesos-Stream-Id` to send the events to.
 
