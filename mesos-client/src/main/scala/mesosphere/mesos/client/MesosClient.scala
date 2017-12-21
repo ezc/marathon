@@ -204,37 +204,36 @@ class MesosClient(
     Note: Merge hub will wait for the _connection context_ object to be fully initialized first meaning that we have current leader's
     `host`, `port` and `Mesos-Stream-Id` to send the events to.
     */
-  private val sink: Sink[(ConnectionContext, Array[Byte]), Future[Done]] = Sink.foreach[(ConnectionContext, Array[Byte])]{
-    case (ctx, bytes) =>
-
-      Http()
-        .singleRequest(
-          HttpRequest(
-            HttpMethods.POST,
-            uri = Uri(s"http://${ctx.url}/api/v1/scheduler"),
-            entity = HttpEntity(ProtobufMediaType, bytes),
-            headers = List(MesosStreamIdHeader(ctx.mesosStreamId))))
-        .map { response =>
+  private val sink: Sink[(ConnectionContext, HttpRequest), Future[Done]] = Sink.foreach[(ConnectionContext, HttpRequest)]{
+    case (ctx, request) => Http().singleRequest(request).map { response =>
           logger.info(s"Response: $response")
           response.discardEntityBytes()
-        }
+    }
   }
 
   private val eventSerializer: Flow[(ConnectionContext, Call), (ConnectionContext, Array[Byte]), NotUsed] = Flow[(ConnectionContext, Call)]
     .map { case (ctx, call) => (ctx, call.toByteArray) }
 
-  // Attach a MergeHub Source to mesos sink. This will materialize to a corresponding Sink.
-  private val hub: RunnableGraph[Sink[Call, NotUsed]] =
+  private val requestBuilder: Flow[(ConnectionContext, Array[Byte]), (ConnectionContext, HttpRequest), NotUsed] = Flow[(ConnectionContext, Array[Byte])]
+    .map { case (ctx, bytes) => (ctx, HttpRequest(
+                                        HttpMethods.POST,
+                                        uri = Uri(s"http://${ctx.url}/api/v1/scheduler"),
+                                        entity = HttpEntity(ProtobufMediaType, bytes),
+                                        headers = List(MesosStreamIdHeader(ctx.mesosStreamId))))
+    }
+
+  private val sinkHub: RunnableGraph[Sink[Call, NotUsed]] =
     MergeHub.source[Call](perProducerBufferSize = 16)
       .mapAsync(1)(event => contextPromise.future.map(ctx => (ctx, event)))
       .via(log("Sending "))
       .via(eventSerializer)
+      .via(requestBuilder)
       .to(sink)
 
   // By running/materializing the consumer we get back a Sink, and hence now have access to feed elements into it.
   // This Sink can be materialized any number of times, and every element that enters the Sink will be consumed by
   // our consumer.
-  override val mesosSink: Sink[Call, NotUsed] = hub.run()
+  override val mesosSink: Sink[Call, NotUsed] = sinkHub.run()
 }
 
 trait MesosApi {
@@ -485,56 +484,7 @@ trait MesosApi {
 }
 
 // TODO: Add more integration tests
+// TODO: Save frameworkId in the connection context and remove it from the API methods
 
-object MesosClient extends StrictLogging {
-
-  /** Run Foo framework that:
-    *  - successfully subscribes
-    *  - declines first offer it gets
-    *
-    *  Not much, but shows the basic idea. Good to test against local mesos.
-    *
-    */
-  def main(args: Array[String]): Unit = {
-    implicit val system = ActorSystem()
-    implicit val materializer = ActorMaterializer()
-    implicit val executionContext = system.dispatcher
-
-    val frameworkInfo = FrameworkInfo(
-      user = "foo",
-      name = "Example FOO Framework",
-      roles = Seq("test"),
-      capabilities = Seq(FrameworkInfo.Capability(`type` = Some(FrameworkInfo.Capability.Type.MULTI_ROLE)))
-    )
-
-    val conf = new MesosConf(List("--master", s"127.0.0.1:5050"))
-    val client = new MesosClient(conf, frameworkInfo)
-
-    val frameworkIDP = Promise[FrameworkID]()
-    val frameworkIDF = frameworkIDP.future
-
-    client.mesosSource.runWith(Sink.foreach { event =>
-
-      if (event.`type`.get == Event.Type.SUBSCRIBED) {  // Save frameworkdId received
-        frameworkIDP.success(event.subscribed.get.frameworkId)
-      }
-      else if (event.`type`.get == Event.Type.OFFERS) { // Test case: decline first offer received
-        val offerId = event.offers.get.offers.head.id
-        logger.info(s"Declining offer with $offerId")
-
-        val frameworkID = Await.result(frameworkIDF, Duration.Inf)  // Should be instant and in the same thread since frameworkIDF is already completed
-        val decline = client.decline(
-          frameworkId = frameworkID,
-          offerIds = Seq(offerId),
-          filters = Some(Filters(Some(5.0f)))
-        )
-        Source.single(decline).runWith(client.mesosSink)
-      }
-
-    }).onComplete{
-      case Success(res) =>
-        logger.info(s"Stream completed: $res"); system.terminate()
-      case Failure(e) => logger.error(s"Error in stream: $e"); system.terminate()
-    }
-  }
+object MesosClient {
 }
