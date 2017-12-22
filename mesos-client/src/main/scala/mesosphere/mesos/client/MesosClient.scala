@@ -6,13 +6,14 @@ import java.util.concurrent.atomic.AtomicReference
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
+import akka.stream._
 import akka.stream.alpakka.recordio.scaladsl.RecordIOFraming
 import akka.stream.scaladsl._
-import akka.stream._
 import akka.util.ByteString
 import akka.{Done, NotUsed}
 import com.google.protobuf
 import com.typesafe.scalalogging.StrictLogging
+import mesosphere.mesos.client.MesosClient.MesosRedicrectException
 import mesosphere.mesos.client.MesosStreamSupport._
 import mesosphere.mesos.conf.MesosConf
 import org.apache.mesos.v1.mesos._
@@ -20,8 +21,7 @@ import org.apache.mesos.v1.scheduler.scheduler.Call.{Accept, Acknowledge, Declin
 import org.apache.mesos.v1.scheduler.scheduler.{Call, Event}
 
 import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Future, Promise}
-import scala.util.{Failure, Success}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 
 class MesosClient(
     conf: MesosConf,
@@ -71,7 +71,13 @@ class MesosClient(
           |
           v
      --------------
-    | BroadcastHub | (6)
+    | Subscribed   | (6)  -> updates connection context
+    | Handler      |
+     --------------
+          |
+          v
+     --------------
+    | BroadcastHub | (7)
      --------------
       |  |  |  |  |
       v  v  v  v  v
@@ -94,11 +100,13 @@ class MesosClient(
     5. Event Deserializer Currently mesos-v1-client only supports protobuf encoded events/calls. Event deserializer uses
        [scalapb](https://scalapb.github.io/) library to parse the extracted RecordIO frame from the previous stage into a mesos
        [Event](https://github.com/apache/mesos/blob/master/include/mesos/scheduler/scheduler.proto#L36)
-    6. BroadcastHub ad the end the flow is going through a broadcast hub. This allows for a dynamic "fan-out" streaming of events and avoids
+    6. Subscribed Handler parses the `SUBSCRIBED` event and updates the connection context with the returned `frameworkId`.
+    7. BroadcastHub ad the end the flow is going through a broadcast hub. This allows for a dynamic "fan-out" streaming of events and avoids
        making multiple upstream connections to mesos when the source is materialized by multiple event consumers.
 
     Note: _Connection Handler_ updates the _connection context_ object with current mesos leader `host` and `port` along with `Mesos-Stream-Id`
-    header value. These settings are used by mesos sink when sending calls to mesos.
+    header value. These settings are used by mesos sink when sending calls to mesos. The same applies to _Subscribed Handler_ which saves
+    `frameworkId` from the `SUBSCRIBED` event in the connection context.
 
     It is declared lazy to decouple instantiation of the MesosClient instance from connection initialization.
     */
@@ -129,9 +137,7 @@ class MesosClient(
 
           // At this point we successfully connected to mesos leader so context should have correct leader's host
           // and port either from the config or set on the redirect.
-          val ctx = context.updateAndGet(c => c.copy(mesosStreamId = streamId.value()))
-          contextPromise.success(ctx)
-
+          context.updateAndGet(c => c.copy(mesosStreamId = Some(streamId.value())))
           response
         case StatusCodes.TemporaryRedirect =>
           val leader = new URI(response.header[headers.Location].get.value())
@@ -149,7 +155,14 @@ class MesosClient(
 
     val eventDeserializer: Flow[ByteString, Event, NotUsed] = Flow[ByteString].map(bytes => Event.parseFrom(bytes.toArray))
 
-    val heartbeatFilter: Flow[Event, Event, NotUsed] = Flow[Event].filterNot(e => e.`type`.exists(_.isHeartbeat))
+    val subscribedHandler: Flow[Event, Event, NotUsed] = Flow[Event].map { event =>
+      if (event.subscribed.isDefined) {
+        val ctx = context.updateAndGet(c => c.copy(frameworkId = Some(event.subscribed.get.frameworkId)))
+        // We save `frameworkId` in the context and successfully complete the promise, meaning the calls in sink
+        contextPromise.success(ctx)
+      }
+      event
+    }
 
     def connectionSource(host: String, port: Int) =
       Source.single(request)
@@ -167,6 +180,7 @@ class MesosClient(
       .via(dataBytesExtractor)
       .via(recordIoScanner)
       .via(eventDeserializer)
+      .via(subscribedHandler)
       .via(log("Received mesos Event: "))
   }
 
@@ -188,31 +202,39 @@ class MesosClient(
           |
           v
      ------------
+    | Call       |
+    | Enhancer   | (2)
+     ------------
+          |
+          v
+     ------------
     | Event      |
-    | Serializer | (2)
+    | Serializer | (3)
      ------------
           |
           v
      ------------
     | Request    |
-    | Builder    | (3)
+    | Builder    | (4)
      ------------
           |
           v
      ------------
-    | Http Sink  | (4)
+    | Http Sink  | (5)
      ------------
 
     1. MergeHub allows dynamic "fan-in" junction point for mesos calls from multiple producers.
-    2. Event Serializer serializes calls to byte array
-    3. Build a HTTP request from the data using `mesosStreamId` header from the context
-    4. Http Sink creates a new connection using akka's `Http().singleRequest` and sends the data
+    2. Call Enhancer updates the call with the framework Id from the connection context
+    3. Event Serializer serializes calls to byte array
+    4. Build a HTTP request from the data using `mesosStreamId` header from the context
+    5. Http Sink creates a new connection using akka's `Http().singleRequest` and sends the data
 
     Note: Merge hub will wait for the _connection context_ object to be fully initialized first meaning that we have current leader's
     `host`, `port` and `Mesos-Stream-Id` to send the events to.
     */
   private val sink: Sink[(ConnectionContext, HttpRequest), Future[Done]] = Sink.foreach[(ConnectionContext, HttpRequest)]{
-    case (ctx, request) => Http().singleRequest(request).map { response =>
+    case (_, request) =>
+      Http().singleRequest(request).map { response =>
           logger.info(s"Response: $response")
           response.discardEntityBytes()
     }
@@ -226,12 +248,20 @@ class MesosClient(
                                         HttpMethods.POST,
                                         uri = Uri(s"http://${ctx.url}/api/v1/scheduler"),
                                         entity = HttpEntity(ProtobufMediaType, bytes),
-                                        headers = List(MesosStreamIdHeader(ctx.mesosStreamId))))
+                                        headers = List(MesosStreamIdHeader(ctx.mesosStreamId.getOrElse(throw new IllegalStateException("MesosStreamId not set."))))))
+    }
+
+  private val callEnhancer: Flow[(ConnectionContext, Call), (ConnectionContext, Call), NotUsed] = Flow[(ConnectionContext, Call)]
+    .map { case (ctx, call) =>
+      (ctx, call.update(
+        _.optionalFrameworkId := Some(ctx.frameworkId.getOrElse(throw new IllegalStateException("FrameworkID not set"))))
+      )
     }
 
   private val sinkHub: RunnableGraph[Sink[Call, NotUsed]] =
     MergeHub.source[Call](perProducerBufferSize = 16)
       .mapAsync(1)(event => contextPromise.future.map(ctx => (ctx, event)))
+      .via(callEnhancer)
       .via(log("Sending "))
       .via(eventSerializer)
       .via(requestBuilder)
@@ -316,9 +346,8 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#teardown
     */
-  def teardown(frameworkId: FrameworkID): Call = {
+  def teardown(): Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.TEARDOWN)
     )
   }
@@ -330,9 +359,8 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#accept
     */
-  def accept(frameworkId: FrameworkID, accepts: Accept): Call = {
+  def accept(accepts: Accept): Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.ACCEPT),
       accept = Some(accepts))
   }
@@ -342,9 +370,8 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#decline
     */
-  def decline(frameworkId: FrameworkID, offerIds: Seq[OfferID], filters: Option[Filters] = None): Call = {
+  def decline(offerIds: Seq[OfferID], filters: Option[Filters] = None): Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.DECLINE),
       decline = Some(Decline(offerIds = offerIds, filters = filters))
     )
@@ -354,9 +381,8 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#revive
     */
-  def revive(frameworkId: FrameworkID, roles: Option[String] = None): Call = {
+  def revive(roles: Option[String] = None): Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.REVIVE),
       revive = Some(Revive(role = roles))
     )
@@ -367,9 +393,8 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/upgrades/#1-2-x-revive-suppress
     */
-  def suppress(frameworkId: FrameworkID, roles: Option[String] = None): Call = {
+  def suppress(roles: Option[String] = None): Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.SUPPRESS),
       suppress = Some(Call.Suppress(roles))
     )
@@ -385,9 +410,8 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#kill
     */
-  def kill(frameworkId: FrameworkID, taskId: TaskID, agentId: Option[AgentID] = None, killPolicy: Option[KillPolicy]): Call = {
+  def kill(taskId: TaskID, agentId: Option[AgentID] = None, killPolicy: Option[KillPolicy]): Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.KILL),
       kill = Some(Kill(taskId = taskId, agentId = agentId, killPolicy = killPolicy))
     )
@@ -398,9 +422,8 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#shutdown
     */
-  def shutdown(frameworkId: FrameworkID, executorId: ExecutorID, agentId: AgentID):Call = {
+  def shutdown(executorId: ExecutorID, agentId: AgentID):Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.SHUTDOWN),
       shutdown = Some(Call.Shutdown(executorId = executorId, agentId = agentId))
     )
@@ -413,9 +436,8 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#acknowledge
     */
-  def acknowledge(frameworkId: FrameworkID, agentId: AgentID, taskId: TaskID, uuid: protobuf.ByteString): Call = {
+  def acknowledge(agentId: AgentID, taskId: TaskID, uuid: protobuf.ByteString): Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.ACKNOWLEDGE),
       acknowledge = Some(Acknowledge(agentId, taskId, uuid))
     )
@@ -427,9 +449,8 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#reconcile
     */
-  def reconcile(frameworkId: FrameworkID, tasks: Seq[Reconcile.Task]): Call = {
+  def reconcile(tasks: Seq[Reconcile.Task]): Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.RECONCILE),
       reconcile = Some(Reconcile(tasks))
     )
@@ -440,9 +461,8 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#message
     */
-  def message(frameworkId: FrameworkID, agentId: AgentID, executorId: ExecutorID, message: ByteString): Call = {
+  def message(agentId: AgentID, executorId: ExecutorID, message: ByteString): Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.MESSAGE),
       message = Some(Message(agentId, executorId, protobuf.ByteString.copyFrom(message.toByteBuffer)))
     )
@@ -453,9 +473,8 @@ trait MesosApi {
     *
     * http://mesos.apache.org/documentation/latest/scheduler-http-api/#request
     */
-  def request(frameworkId: FrameworkID, requests: Seq[Request]): Call = {
+  def request(requests: Seq[Request]): Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.REQUEST),
       request = Some(Call.Request(requests = requests))
     )
@@ -466,9 +485,8 @@ trait MesosApi {
     *
     * https://mesosphere.com/blog/mesos-inverse-offers/
     */
-  def acceptInverseOffers(frameworkId: FrameworkID, offers: Seq[OfferID], filters: Option[Filters] = None): Call = {
+  def acceptInverseOffers(offers: Seq[OfferID], filters: Option[Filters] = None): Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.ACCEPT_INVERSE_OFFERS),
       acceptInverseOffers = Some(Call.AcceptInverseOffers(inverseOfferIds = offers, filters = filters))
     )
@@ -480,9 +498,8 @@ trait MesosApi {
     *
     * https://mesosphere.com/blog/mesos-inverse-offers/
     */
-  def declineInverseOffers(frameworkId: FrameworkID, offers: Seq[OfferID], filters: Option[Filters] = None): Call = {
+  def declineInverseOffers(offers: Seq[OfferID], filters: Option[Filters] = None): Call = {
     Call(
-      frameworkId = Some(frameworkId),
       `type` = Some(Call.Type.DECLINE_INVERSE_OFFERS),
       declineInverseOffers = Some(Call.DeclineInverseOffers(inverseOfferIds = offers, filters = filters))
     )
@@ -491,7 +508,7 @@ trait MesosApi {
 }
 
 // TODO: Add more integration tests
-// TODO: Save frameworkId in the connection context and remove it from the API methods
 
 object MesosClient {
+  case class MesosRedicrectException(leader: URI) extends Exception(s"New mesos leader available at $leader")
 }

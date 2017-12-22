@@ -36,20 +36,27 @@ Mesos source is an akka-stream `Source[Event, NotUsed]` that frameworks can atta
       |
       v
  --------------
+| Subscribed   | (6)  -> updates connection context
+| Handler      |
+ --------------
+      |
+      v
+ --------------
 | BroadcastHub | (6)
  --------------
   |  |  |  |  |
   v  v  v  v  v
 ```
 
-1. **Http Connection** mesos-v1-client uses akka-http low-level `Http.outgoingConnection()` to `POST` a [SUBSCRIBE](http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1) request to mesos `api/v1/scheduler` endpoint providing framework info. The HTTP response is a stream in RecordIO format which is handled by the later stages.
-2. **Connection Handler** handles connection HTTP response, saving `Mesos-Stream-Id`(see the description of the [SUBSCRIBE](http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1) call) in client's _connection context_ object to later use it in mesos sink. Schedulers are expected to make HTTP requests to the leading master. If requests are made to a non-leading master a `HTTP 307 Temporary Redirect` will be received with the `Location` header pointing to the leading master. We update connection context with the new leader address and throw a `MesosRedicrectException` which is handled it in the `recover` stage by building a new flow that reconnects to the new leader.
+1. **Http Connection** mesos-v1-client uses akka-http low-level `Http.outgoingConnection()` to `POST` a [SUBSCRIBE](http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1) request to mesos `api/v1/scheduler` endpoint providing framework info. The HTTP response is a stream in RecordIO format which is handled by the later stages
+2. **Connection Handler** handles connection HTTP response, saving `Mesos-Stream-Id`(see the description of the [SUBSCRIBE](http://mesos.apache.org/documentation/latest/scheduler-http-api/#subscribe-1) call) in client's _connection context_ object to later use it in mesos sink. Schedulers are expected to make HTTP requests to the leading master. If requests are made to a non-leading master a `HTTP 307 Temporary Redirect` will be received with the `Location` header pointing to the leading master. We update connection context with the new leader address and throw a `MesosRedicrectException` which is handled it in the `recover` stage by building a new flow that reconnects to the new leader
 3. **Data Byte Extractor** simply extracts byte data from the response body
-4. **RecordIO Scanner** Each stream message is encoded in RecordIO format, which essentially prepends to a single record (either JSON or serialized protobuf) its length in bytes: `[<length>\n<json string|protobuf bytes>]`. More about the format [here](http://mesos.apache.org/documentation/latest/scheduler-http-api/#recordio-response-format-1). RecordIO Scanner uses `RecordIOFraming.Scanner` from the [alpakka-library](https://github.com/akka/alpakka) to parse the extracted bytes into a complete message frame.
+4. **RecordIO Scanner** Each stream message is encoded in RecordIO format, which essentially prepends to a single record (either JSON or serialized protobuf) its length in bytes: `[<length>\n<json string|protobuf bytes>]`. More about the format [here](http://mesos.apache.org/documentation/latest/scheduler-http-api/#recordio-response-format-1). RecordIO Scanner uses `RecordIOFraming.Scanner` from the [alpakka-library](https://github.com/akka/alpakka) to parse the extracted bytes into a complete message frame
 5. **Event Deserializer** Currently mesos-v1-client only supports protobuf encoded events/calls. Event deserializer uses [scalapb](https://scalapb.github.io/) library to parse the extracted RecordIO frame from the previous stage into a mesos [Event](https://github.com/apache/mesos/blob/master/include/mesos/scheduler/scheduler.proto#L36)
-6. **BroadcastHub** ad the end the flow is going through a broadcast hub. This allows for a dynamic "fan-out" streaming of events and avoids making multiple upstream connections to mesos when the source is materialized by multiple event consumers.
+6. **Subscribed Handler** parses the `SUBSCRIBED` event and updates the connection context with the returned `frameworkId`.
+7. **BroadcastHub** ad the end the flow is going through a broadcast hub. This allows for a dynamic "fan-out" streaming of events and avoids making multiple upstream connections to mesos when the source is materialized by multiple event consumers
 
-Note: _Connection Handler_ updates the _connection context_ object with current leader's `host` and `port` along with `Mesos-Stream-Id` header value. These settings are used by mesos sink when sending calls to mesos.
+Note: _Connection Handler_ updates the _connection context_ object with current leader's `host` and `port` along with `Mesos-Stream-Id` header value. These settings are used by mesos sink when sending calls to mesos. The same applies to _Subscribed Handler_ which saves `frameworkId` from the `SUBSCRIBED` event in the connection context.
 
 ## Mesos Sink
 Mesos sink is an akka-stream `Sink[Call, Notused]` that sends calls to mesos. Every call is send via a new (and pooled) connection. The flow visualized:
@@ -63,25 +70,32 @@ Mesos sink is an akka-stream `Sink[Call, Notused]` that sends calls to mesos. Ev
       |
       v
  ------------
+| Call       |
+| Enhancer   | (2)
+ ------------
+     |
+     v
+ ------------
 | Event      |
-| Serializer | (2)
+| Serializer | (3)
  ------------
       |
       v
  ------------
 | Request    |
-| Builder    | (3)
+| Builder    | (4)
  ------------
       |
       v
  ------------
-| Http Sink  | (4)
+| Http Sink  | (5)
  ------------
 ```
-1. **MergeHub** allows dynamic "fan-in" junction point for mesos calls from multiple producers.
-2. **Event Serializer** serializes calls to byte array
-3. **Request Builder** builds a HTTP request from the data using `mesosStreamId` header from the context
-4. **Http Sink** creates a new connection using akka's `Http().singleRequest` and sends the data
+1. **MergeHub** allows dynamic "fan-in" junction point for mesos calls from multiple producers
+2. **Call Enhancer** updates the mesos call with the framework Id from the connection context
+3. **Event Serializer** serializes calls to byte array
+4. **Request Builder** builds a HTTP request from the data using `mesosStreamId` header from the context
+5. **Http Sink** creates a new connection using akka's `Http().singleRequest` and sends the data
 
 Note: Merge hub will wait for the _connection context_ object to be fully initialized first meaning that we have current leader's `host`, `port` and `Mesos-Stream-Id` to send the events to.
 
@@ -112,4 +126,4 @@ trait MesosApi {
   val killSwitch: UniqueKillSwitch
   ```
 
-  It also provides a number of helper methods to build mesos calls e.g. `def accept(frameworkId: FrameworkID, accepts: Accept): Call` will return an `Accept` call.
+  It also provides a number of helper methods to build mesos calls e.g. `def accept(accepts: Accept): Call` will return an `Accept` call.

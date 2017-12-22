@@ -34,6 +34,15 @@ class MesosClientIntegrationTest extends AkkaUnitTest
       case events =>
         events.head.`type` shouldBe Some(Event.Type.SUBSCRIBED)
     }
+
+    And("connection context should be initialized")
+    inside(f.client.contextPromise.future.futureValue) {
+      case ConnectionContext(host, port, mesosStreamId, frameworkId) =>
+        host shouldBe f.conf.mesosMasterHost
+        port shouldBe f.conf.mesosMasterPort
+        mesosStreamId shouldBe defined
+        frameworkId shouldBe defined
+    }
   }
 
   "Mesos client should successfully subscribe to mesos with framework Id" in {
@@ -48,6 +57,15 @@ class MesosClientIntegrationTest extends AkkaUnitTest
         case events =>
           events.head.`type` shouldBe Some(Event.Type.SUBSCRIBED)
           events.head.subscribed.get.frameworkId shouldBe frameworkID
+      }
+
+      And("connection context should be initialized")
+      inside(f.client.contextPromise.future.futureValue) {
+        case ConnectionContext(host, port, mesosStreamId, frameworkId) =>
+          host shouldBe f.conf.mesosMasterHost
+          port shouldBe f.conf.mesosMasterPort
+          mesosStreamId shouldBe defined
+          frameworkId shouldBe Some(frameworkID)
       }
     }
   }
@@ -77,13 +95,12 @@ class MesosClientIntegrationTest extends AkkaUnitTest
   "Mesos client should successfully declines offers" in withFixture() { f =>
     When("a framework subscribes")
     var events: Seq[Event] = f.client.mesosSource.take(3).runWith(Sink.seq).futureValue
-    val frameworkId = events.head.subscribed.get.frameworkId
+
     val offer = events.filter(_.`type`.contains(Event.Type.OFFERS)).head
     val offerId = offer.offers.get.offers.head.id
 
     And("an offer event is received")
     val decline = f.client.decline(
-      frameworkId = frameworkId,
       offerIds = Seq(offerId),
       filters = Some(Filters(Some(0.0f)))
     )

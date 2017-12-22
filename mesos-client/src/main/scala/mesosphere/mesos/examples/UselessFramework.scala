@@ -6,11 +6,9 @@ import akka.stream.scaladsl.{Sink, Source}
 import com.typesafe.scalalogging.StrictLogging
 import mesosphere.mesos.client.MesosClient
 import mesosphere.mesos.conf.MesosConf
-import org.apache.mesos.v1.mesos.{Filters, FrameworkID, FrameworkInfo, OfferID}
+import org.apache.mesos.v1.mesos.{Filters, FrameworkInfo}
 import org.apache.mesos.v1.scheduler.scheduler.Event
 
-import scala.concurrent.duration.Duration
-import scala.concurrent.{Await, Promise}
 import scala.util.{Failure, Success}
 
 object UselessFramework extends App with StrictLogging {
@@ -37,23 +35,18 @@ object UselessFramework extends App with StrictLogging {
     val conf = new MesosConf(List("--master", s"127.0.0.1:5050"))
     val client = new MesosClient(conf, frameworkInfo)
 
-    val frameworkIDP = Promise[FrameworkID]()
-    val frameworkIDF = frameworkIDP.future
-
     client.mesosSource.runWith(Sink.foreach { event =>
 
-      if (event.`type`.get == Event.Type.SUBSCRIBED) {  // Save frameworkdId received
-        frameworkIDP.success(event.subscribed.get.frameworkId)
+      if (event.`type`.get == Event.Type.SUBSCRIBED) {
+        logger.info("Successfully subscribed to mesos")
       }
-      else if (event.`type`.get == Event.Type.OFFERS) { // Test case: decline first offer received
+      else if (event.`type`.get == Event.Type.OFFERS) {
 
-        val frameworkID = Await.result(frameworkIDF, Duration.Inf)  // Should be instant and in the same thread since frameworkIDF is already completed
         val offerIds = event.offers.get.offers.map(_.id).toList
 
         Source(offerIds)
-          .map{ oId => logger.info(s"Declining offer with id = ${oId.value}"); oId }
+          .map{ oId => logger.info(s"Declining offer with id = ${oId.value}"); oId }  // Decline all offers
           .map(oId => client.decline(
-              frameworkId = frameworkID,
               offerIds = Seq(oId),
               filters = Some(Filters(Some(5.0f)))
             ))
